@@ -1,4 +1,5 @@
 import React from "react";
+import { useTranslation } from "react-i18next";
 import {
   FaCheckCircle,
   FaQuestionCircle,
@@ -7,9 +8,11 @@ import {
   FaRegClock,
   FaRegTimesCircle,
 } from "react-icons/fa";
+import { VscListOrdered } from "react-icons/vsc";
 import { useSelector } from "react-redux";
-import { Plan, Task, TaskState } from "../services/planService";
-import { RootState } from "../store";
+import { I18nKey } from "#/i18n/declaration";
+import { Task, TaskState } from "#/services/taskService";
+import { RootState } from "#/store";
 
 function StatusIcon({ status }: { status: TaskState }): JSX.Element {
   switch (status) {
@@ -50,31 +53,26 @@ function TaskCard({ task, level }: { task: Task; level: number }): JSX.Element {
   );
 }
 
-interface PlanProps {
-  plan: Plan;
-}
+function Planner(): JSX.Element {
+  const { t } = useTranslation();
+  const task = useSelector((state: RootState) => state.task.task);
 
-function PlanContainer({ plan }: PlanProps): JSX.Element {
-  if (plan.mainGoal === undefined) {
+  if (!task || !task.subtasks?.length) {
     return (
-      <div className="p-2">
-        Nothing is currently planned. Start a task for this to change.
+      <div className="w-full h-full flex flex-col text-neutral-400 items-center justify-center">
+        <VscListOrdered size={100} />
+        {t(I18nKey.PLANNER$EMPTY_MESSAGE)}
       </div>
     );
   }
-  return (
-    <div className="p-2 overflow-y-auto h-full flex flex-col gap-2">
-      <TaskCard task={plan.task} level={0} />
-    </div>
-  );
-}
-
-function Planner(): JSX.Element {
-  const plan = useSelector((state: RootState) => state.plan.plan);
 
   return (
     <div className="h-full w-full bg-neutral-800">
-      <PlanContainer plan={plan} />
+      <div className="p-2 overflow-y-auto h-full flex flex-col gap-2">
+        {task.subtasks.map((subtask) => (
+          <TaskCard key={subtask.id} task={subtask} level={0} />
+        ))}
+      </div>
     </div>
   );
 }

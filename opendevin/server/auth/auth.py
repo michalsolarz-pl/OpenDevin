@@ -1,10 +1,8 @@
-import os
 import jwt
-from typing import Dict
-from opendevin.logger import opendevin_logger as logger
 from jwt.exceptions import InvalidTokenError
 
-JWT_SECRET = os.getenv('JWT_SECRET', '5ecRe7')
+from opendevin.core.config import config
+from opendevin.core.logger import opendevin_logger as logger
 
 
 def get_sid_from_token(token: str) -> str:
@@ -19,7 +17,7 @@ def get_sid_from_token(token: str) -> str:
     """
     try:
         # Decode the JWT using the specified secret and algorithm
-        payload = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
+        payload = jwt.decode(token, config.jwt_secret, algorithms=['HS256'])
 
         # Ensure the payload contains 'sid'
         if 'sid' in payload:
@@ -34,10 +32,10 @@ def get_sid_from_token(token: str) -> str:
     return ''
 
 
-def sign_token(payload: Dict[str, object]) -> str:
+def sign_token(payload: dict[str, object]) -> str:
     """Signs a JWT token."""
     # payload = {
     #     "sid": sid,
     #     # "exp": datetime.now(timezone.utc) + timedelta(minutes=15),
     # }
-    return jwt.encode(payload, JWT_SECRET, algorithm='HS256')
+    return jwt.encode(payload, config.jwt_secret, algorithm='HS256')

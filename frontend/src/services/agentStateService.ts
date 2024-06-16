@@ -1,11 +1,18 @@
-import ActionType from "../types/ActionType";
-import Socket from "./socket";
-import AgentTaskAction from "../types/AgentTaskAction";
+import ActionType from "#/types/ActionType";
+import AgentState from "#/types/AgentState";
+import Session from "./session";
 
-export function changeTaskState(message: AgentTaskAction): void {
+const INIT_DELAY = 1000;
+
+export function changeAgentState(state: AgentState): void {
   const eventString = JSON.stringify({
-    action: ActionType.CHANGE_TASK_STATE,
-    args: { task_state_action: message },
+    action: ActionType.CHANGE_AGENT_STATE,
+    args: { agent_state: state },
   });
-  Socket.send(eventString);
+  Session.send(eventString);
+  if (state === AgentState.STOPPED) {
+    setTimeout(() => {
+      Session.startNewSession();
+    }, INIT_DELAY);
+  }
 }

@@ -1,23 +1,21 @@
-from opendevin.parse_commands import parse_command_file
-
 DEFAULT_COMMANDS_DICT = {
     'exit': 'Executed when task is complete',
-    'read <file_name> [<start_line>] [<end_line>]': 'Shows a given file\'s contents starting from <start_line> up to <end_line>. Default: start_line = 0, end_line = -1. By default the whole file will be read.',
+    'read <file_name> [<start_line>] [<end_line>]': "Shows a given file's contents starting from <start_line> up to <end_line>. Default: start_line = 0, end_line = -1. By default the whole file will be read.",
     'write <file> <changes> [<start_line>] [<end_line>]': 'Modifies a <file> by replacing the current lines between <start_line> and <end_line> with <changes>. Default start_line = 0 and end_line = -1. Calling this with no line args will replace the whole file.',
     'browse <url>': 'Returns the text version of any url, this can be useful to look up documentation or finding issues on github',
     'scroll_up': 'Takes no arguments. This will scroll up and show you the 100 lines above your current lines',
     'scroll_down': 'Takes no arguments. This will scroll down and show you the 100 lines below your current lines',
-    'edit <start_line> <end_line> <changes>': 'This will modify lines in the currently open file. use start_line and end_line to designate which lines to change and then write the multiline changes',
+    'edit <start_line> <end_line> <changes>': 'This will modify lines in the currently open file. use start_line and end_line to designate which lines to change and then write the multiline changes. Set end_line to -1 to denote the end of the file',
     'goto <line_num>': 'This will take you directly to a line and show you the 100 lines below it.',
     '<bash_command> <args>': 'You can use any bash command you need (cd, ls, rm, grep, dir, mv, wget, git, zip, etc.) with their arguments included',
     'pip install <package>': 'You can use this to import python packages. Make sure you include the correct package name when using this command.',
     'ls': 'Use the ls command to view all the files in your current directory, this is a good starting point.',
-    'NOT ALLOWED': 'You cannot use interactive commands like python or node'
+    'NOT ALLOWED': 'You cannot use interactive commands like python or node',
 }
 
 COMMAND_USAGE = {
     'exit': 'Usage:\n```\nexit\n```\nExecuted when task is complete',
-    'read': 'Args:\n<file_name> [<start_line>] [<end_line>]\nUsage:\n```\nread file.py\n```\nor\n```\nread example.py <start_line> <end_line>\n```\nShows a given file\'s contents starting from <start_line> up to <end_line>. Default: start_line = 0, end_line = -1. by default the whole file will be read.',
+    'read': "Args:\n<file_name> [<start_line>] [<end_line>]\nUsage:\n```\nread file.py\n```\nor\n```\nread example.py <start_line> <end_line>\n```\nShows a given file's contents starting from <start_line> up to <end_line>. Default: start_line = 0, end_line = -1. by default the whole file will be read.",
     'write': 'Args:\n<file> <changes> [<start_line>] [<end_line>]\nUsage:\n```\nwrite "def main():\n    print("This is line one")" 0 2\n```\nModifies a <file> by replacing the current lines between <start_line> and <end_line> with <changes>. Default start_line = 0 and end_line = -1. Calling this with no line args will replace the whole file.',
     'edit': 'Args:\n<start_line> <end_line> <changes>\nUsage:\n```\nedit 0 1 import pandas as pd\n```\nThis will modify the current file you are in with the changes you make between the line numbers you designate',
     'goto': 'Args:\n<line_num>\nUsage:\n```\ngoto <line_num>\n```\nThis will show you the 100 lines below and including the line you specify within your current file.',
@@ -26,10 +24,11 @@ COMMAND_USAGE = {
     'browse': 'Args:\n<url>\nUsage:\n```\nbrowse https://github.com/OpenDevin/OpenDevin\n```\nThis will fetch the Text elements from the given url and show them to you.',
 }
 
-DEFAULT_COMMANDS = '\n'.join(
-    [k + ' - ' + v for k, v in DEFAULT_COMMANDS_DICT.items()])
+DEFAULT_COMMANDS = '\n'.join([k + ' - ' + v for k, v in DEFAULT_COMMANDS_DICT.items()])
 
-CUSTOM_DOCS = parse_command_file()
+# from opendevin.parse_commands import parse_command_file
+# USE parse_command_file(filepath) to get the custom commands
+CUSTOM_DOCS = None
 
 CUSTOM_COMMANDS = f"""Custom bash commands:
 {CUSTOM_DOCS}
@@ -51,7 +50,7 @@ To modify the current file use 'edit'. To move through the current file use 'got
 when using write and edit do not surround the code with any "" just write the code.
 """
 
-GENERAL_GUIDELINES = '''INSTRUCTIONS:
+GENERAL_GUIDELINES = """INSTRUCTIONS:
 Now, you're going to solve this issue on your own. You can use any bash commands or custom commands you wish to complete your task. Edit all the files you need to and run any checks or tests that you want.
 Remember, YOU CAN ONLY ENTER ONE COMMAND AT A TIME. You should always wait for feedback after every command.
 When you're satisfied with all of the changes you've made, you can indicate that you are done by running the exit command.
@@ -68,9 +67,9 @@ IMPORTANT TIPS:
 5. Understand your context: Always make sure to look at the currently open file and the current working directory. The currently open file might be in a different directory than the working directory.
 6. Verify your edits: When editing files, it is easy to accidentally specify a wrong line number or to write code with incorrect indentation. Always check the code after you issue an edit to make sure that it reflects what you wanted to accomplish. If it didn't, issue another command to fix it.
 7. Thoroughly test your solution: After making any changes to fix a bug, be sure to thoroughly test your solution to ensure the bug has been resolved. Re-run the bug reproduction script and verify that the issue has been addressed.
-'''
+"""
 
-RESPONSE_FORMAT = '''RESPONSE FORMAT:
+RESPONSE_FORMAT = """RESPONSE FORMAT:
 This is the format of the response you will make in order to solve the current issue.
 You will be given multiple iterations to complete this task so break it into steps and solve them one by one.
 
@@ -93,7 +92,7 @@ Notes:
 - To execute multiple commands you should write them down in your thoughts section so you can remember it on the next step and execute them then.
 - The only commands you are not capable of executing are interactive commands like `python` or `node` by themselves.
 - If you think that you have completed the task that has been given to you based on your previous actions and outputs then use ``` exit ``` as the command to let the system know that you are done.
-- DO NOT make any copies of your previous memories those will be provided to you at each step, making copies just wastes time and energy. Think smarter not harder.
+- DO NOT make any copies of your previous memories, those will be provided to you at each step, making copies just wastes time and energy. Think smarter not harder.
 - The write and edit commands requires proper indentation in the content section ex. `write hw.py def hello():\n    print(\'Hello World\')` this is how you would have to format your write command.
     - The white spaces matter as the code changes will be added to the code so they must have proper syntax.
 
@@ -112,20 +111,21 @@ Action:
 [ END FORMAT ]
 
 Do not provide anything extra just your thought and action.
-'''
+"""
 
-SYSTEM_MESSAGE = f'''SYSTEM INFO:
-You am an autonomous coding agent, here to provide solutions for coding issues.
-You have been designed to assist you with a wide range of programming tasks, from code editing and debugging to testing and deployment.
+SYSTEM_MESSAGE = f"""SYSTEM INFO:
+You are an autonomous coding agent, here to provide solutions for coding issues.
+You have been designed to assist with a wide range of programming tasks, from code editing and debugging to testing and deployment.
 You have access to a variety of tools and commands that you can use to help you solve problems efficiently.
 
 {GENERAL_GUIDELINES}
 
 {DOCUMENTATION}
-'''.strip()
+""".strip()
 
 
-def NO_ACTION(latest): return f'''
+def NO_ACTION(latest):
+    return f"""
 You did not include any action to take in your most recent output:
 
 ===== Output ======
@@ -140,20 +140,21 @@ This time, be sure to use the exact format below, replacing anything in <> with 
 {RESPONSE_FORMAT}
 
 It is crucial you use the format provided as the output will be parsed automatically.
-'''
+"""
 
 
 def file_info(file: str, line: int):
     if file:
-        return f'''CURRENT WORKSPACE:
+        return f"""CURRENT WORKSPACE:
     Open File: {file} on line {line}
     You can use these commands with the current file:
     Navigation: `scroll_up`, `scroll_down`, and `goto <line>`
     Modification: `edit <start_line> <end_line> <changes>`
-    '''
+    """
 
 
-def STEP_PROMPT(task, file, line_num): return f'''
+def STEP_PROMPT(task, file, line_num):
+    return f"""
 {RESPONSE_FORMAT}
 You are currently trying to complete this task:
 {task}
@@ -167,11 +168,12 @@ Be very strict about the formatting that you use and make sure you follow the gu
 NEVER output multiple commands. ONLY take ONE STEP at a time.
 When you have completed your task run the "exit" command.
 Begin with your thought about the next step and then come up with an action to perform your thought.
-'''.strip()
+""".strip()
 
 
-def unpack_dict(data: dict, restrict: list[str] = []):
+def unpack_dict(data: dict, restrict: list[str] | None = None):
     lines = []
+    restrict = [] if restrict is None else restrict
     for key, value in data.items():
         if key in restrict:
             continue
@@ -184,13 +186,14 @@ def unpack_dict(data: dict, restrict: list[str] = []):
     return '\n'.join(lines)
 
 
-def MEMORY_FORMAT(act, obs): return f'''
+def MEMORY_FORMAT(act, obs):
+    return f"""
 Previous Action:
 {unpack_dict(act, ["content"])}
 
 Output from Action:
 {unpack_dict(obs)}
-'''.strip()
+""".strip()
 
 
 def CONTEXT_PROMPT(memory, window):

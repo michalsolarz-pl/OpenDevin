@@ -13,7 +13,8 @@ describe("Browser", () => {
       },
     });
 
-    expect(getByText(/no screenshot available/i)).toBeInTheDocument();
+    // i18n empty message key
+    expect(getByText(/BROWSER\$EMPTY_MESSAGE/i)).toBeInTheDocument();
   });
 
   it("renders the url and a screenshot", () => {
