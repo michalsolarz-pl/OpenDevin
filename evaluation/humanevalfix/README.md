@@ -1,37 +1,10 @@
-# HumanEvalFix Evaluation with OpenDevin
+# HumanEvalFix Evaluation with OpenHands
 
-Implements evaluation of agents on HumanEvalFix from the HumanEvalPack benchmark introduced in [OctoPack: Instruction Tuning Code Large Language Models](https://arxiv.org/abs/2308.07124). Please see [here](https://github.com/bigcode-project/bigcode-evaluation-harness/blob/main/bigcode_eval/tasks/humanevalpack.py) for the reference implementation used in the paper.
+Implements evaluation of agents on HumanEvalFix from the HumanEvalPack benchmark introduced in [OctoPack: Instruction Tuning Code Large Language Models](https://arxiv.org/abs/2308.07124). Please see [here](https://github.com/bigcode-project/bigcode-evaluation-harness/blob/main/bigcode_eval/tasks/humanevalpack.py) for the reference implementation used in the paper. Currently only `python` evaluation is supported.
 
-## Setup Environment
+## Setup Environment and LLM Configuration
 
-Please follow [this document](https://github.com/OpenDevin/OpenDevin/blob/main/Development.md) to setup local develop environment for OpenDevin.
-
-
-## Configure OpenDevin and your LLM
-
-Create a `config.toml` file if it does not exist at the root of the workspace.
-
-Add the following configurations:
-
-```toml
-[core]
-max_iterations = 100
-cache_dir = "/tmp/cache"
-ssh_hostname = "localhost"
-enable_auto_lint = true
-
-# TODO: Change these to the model you want to evaluate
-[eval_gpt4_1106_preview]
-model = "gpt-4-1106-preview"
-api_key = "XXX"
-temperature = 0.0
-
-[eval_some_openai_compatible_model]
-model = "openai/MODEL_NAME"
-base_url = "https://OPENAI_COMPATIBLE_URL/v1"
-api_key = "XXX"
-temperature = 0.0
-```
+Please follow instruction [here](../README.md#setup) to setup your local development environment and LLM.
 
 ## Run Inference on HumanEvalFix
 
@@ -44,7 +17,7 @@ You can replace `eval_gpt4_1106_preview` with any model you set up in `config.to
 
 ## Examples
 
-For each problem, OpenDevin is given a set number of iterations to fix the failing code. The history field shows each iteration's response to correct its code that fails any test case.
+For each problem, OpenHands is given a set number of iterations to fix the failing code. The history field shows each iteration's response to correct its code that fails any test case.
 
 
 ```
@@ -88,7 +61,6 @@ For each problem, OpenDevin is given a set number of iterations to fix the faili
                 "action": "run",
                 "args": {
                     "command": "open Python__2.py",
-                    "background": false,
                     "thought": "Let's start by opening the Python__2.py file to see the current implementation of the function."
                 }
             },
@@ -116,7 +88,6 @@ For each problem, OpenDevin is given a set number of iterations to fix the faili
                 "action": "run",
                 "args": {
                     "command": "edit 2:2 <<EOF\n    return number % 1.0\nEOF",
-                    "background": false,
                     "thought": "The current implementation of the function `truncate_number` is incorrect because it adds 1.0 to the fractional part of the number. This is not necessary and is causing the function to fail the test cases. \n\nThe correct implementation should only return the fractional part of the number. This can be achieved by using the modulus operator with 1.0, which will return the fractional part of the number.\n\nLet's correct the function implementation."
                 }
             },
@@ -144,7 +115,6 @@ For each problem, OpenDevin is given a set number of iterations to fix the faili
                 "action": "run",
                 "args": {
                     "command": "python3 Python__2.py",
-                    "background": false,
                     "thought": "The function `truncate_number` has been updated. Now, let's run the Python file to see if the test cases pass."
                 }
             },

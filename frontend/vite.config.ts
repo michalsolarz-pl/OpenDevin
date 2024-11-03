@@ -1,8 +1,10 @@
+/* eslint-disable import/no-extraneous-dependencies */
 /// <reference types="vitest" />
+/// <reference types="vite-plugin-svgr/client" />
 import { defineConfig, loadEnv } from "vite";
-import react from "@vitejs/plugin-react";
 import viteTsconfigPaths from "vite-tsconfig-paths";
-import path from "path";
+import svgr from "vite-plugin-svgr";
+import { vitePlugin as remix } from "@remix-run/dev";
 
 export default defineConfig(({ mode }) => {
   const {
@@ -21,18 +23,50 @@ export default defineConfig(({ mode }) => {
   const WS_URL = `${WS_PROTOCOL}://${VITE_BACKEND_HOST}/`;
   const FE_PORT = Number.parseInt(VITE_FRONTEND_PORT, 10);
 
-  // check BACKEND_HOST is something like "example.com"
-  if (!VITE_BACKEND_HOST.match(/^([\w\d-]+(\.[\w\d-]+)+(:\d+)?)/)) {
-    throw new Error(
-      `Invalid BACKEND_HOST ${VITE_BACKEND_HOST}, example BACKEND_HOST 127.0.0.1:3000`,
+  /**
+   * This script is used to unpack the client directory from the frontend build directory.
+   * Remix SPA mode builds the client directory into the build directory. This function
+   * moves the contents of the client directory to the build directory and then removes the
+   * client directory.
+   *
+   * This script is used in the buildEnd function of the Vite config.
+   */
+  const unpackClientDirectory = async () => {
+    const fs = await import("fs");
+    const path = await import("path");
+
+    const buildDir = path.resolve(__dirname, "build");
+    const clientDir = path.resolve(buildDir, "client");
+
+    const files = await fs.promises.readdir(clientDir);
+    await Promise.all(
+      files.map((file) =>
+        fs.promises.rename(
+          path.resolve(clientDir, file),
+          path.resolve(buildDir, file),
+        ),
+      ),
     );
-  }
+
+    await fs.promises.rmdir(clientDir);
+  };
 
   return {
-    // depending on your application, base can also be "/"
-    base: "",
-    plugins: [react(), viteTsconfigPaths()],
-    clearScreen: false,
+    plugins: [
+      !process.env.VITEST &&
+        remix({
+          future: {
+            v3_fetcherPersist: true,
+            v3_relativeSplatPath: true,
+            v3_throwAbortReason: true,
+          },
+          appDirectory: "src",
+          buildEnd: unpackClientDirectory,
+          ssr: false,
+        }),
+      viteTsconfigPaths(),
+      svgr(),
+    ],
     server: {
       port: FE_PORT,
       proxy: {
@@ -49,10 +83,18 @@ export default defineConfig(({ mode }) => {
         },
       },
     },
+    ssr: {
+      noExternal: ["react-syntax-highlighter"],
+    },
+    clearScreen: false,
     test: {
       environment: "jsdom",
-      globals: true,
       setupFiles: ["vitest.setup.ts"],
+      coverage: {
+        reporter: ["text", "json", "html", "lcov", "text-summary"],
+        reportsDirectory: "coverage",
+        include: ["src/**/*.{ts,tsx}"],
+      },
     },
   };
 });

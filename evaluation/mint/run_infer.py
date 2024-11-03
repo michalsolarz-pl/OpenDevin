@@ -1,42 +1,42 @@
 import asyncio
 import functools
-import json
-import logging
-import multiprocessing as mp
 import os
-import pathlib
-import subprocess
-import time
-from concurrent.futures import ProcessPoolExecutor
-from typing import Dict
+from typing import Any
 
-import tasks
-from config_variables import TASK_INFO_MAP
+import pandas as pd
 from datasets import load_dataset
-from datatypes import TaskState
-from env import SimplifiedEnv
-from prompts import ToolPromptTemplate
-from tasks import Task
-from tqdm import tqdm
 
-from evaluation.swe_bench.swe_env_box import DockerSSHBox
-from opendevin.controller.state.state import State
-from opendevin.core.config import config, get_llm_config_arg, get_parser
-from opendevin.core.logger import get_console_handler
-from opendevin.core.logger import opendevin_logger as logger
-from opendevin.core.main import main
-from opendevin.events.serialization.event import event_to_dict
+from evaluation.mint.datatypes import TaskState
+from evaluation.mint.env import SimplifiedEnv
+from evaluation.mint.prompts import ToolPromptTemplate
+from evaluation.mint.tasks import Task
+from evaluation.utils.shared import (
+    EvalMetadata,
+    EvalOutput,
+    make_metadata,
+    prepare_dataset,
+    reset_logger_for_multiprocessing,
+    run_evaluation,
+)
+from openhands.controller.state.state import State
+from openhands.core.config import (
+    AppConfig,
+    SandboxConfig,
+    get_llm_config_arg,
+    get_parser,
+)
+from openhands.core.logger import openhands_logger as logger
+from openhands.core.main import create_runtime, run_controller
+from openhands.events.action import (
+    CmdRunAction,
+    MessageAction,
+)
+from openhands.events.observation import CmdOutputObservation
+from openhands.runtime.base import Runtime
+from openhands.utils.async_utils import call_async_from_sync
 
 
-def cleanup():
-    print('Cleaning up child processes...')
-    for process in mp.active_children():
-        print(f'Terminating child process: {process.name}')
-        process.terminate()
-        process.join()
-
-
-def codeact_user_response(state: State, task: Task, task_config: Dict[str, int]):
+def codeact_user_response_mint(state: State, task: Task, task_config: dict[str, int]):
     logger.info(f'Gold reference: {task.reference}')
     logger.info(f'Task config: {task_config}')
 
@@ -45,10 +45,10 @@ def codeact_user_response(state: State, task: Task, task_config: Dict[str, int])
         task=task,
         task_config=task_config,
     )
-    last_action, _ = state.history[-1]
-    result_state: TaskState = env.step(last_action.message)
+    last_action = state.history.get_last_action()
+    result_state: TaskState = env.step(last_action.message or '')
 
-    state.task_state = result_state
+    state.extra_data['task_state'] = result_state
 
     if not result_state.latest_output:
         # Task is finished
@@ -60,105 +60,132 @@ def codeact_user_response(state: State, task: Task, task_config: Dict[str, int])
     return msg
 
 
-def monologue_user_response(state: State) -> str:
-    raise NotImplementedError('MonologueAgent should never ask for user responses.')
-
-
 AGENT_CLS_TO_FAKE_USER_RESPONSE_FN = {
-    'CodeActAgent': codeact_user_response,
-    'MonologueAgent': monologue_user_response,
+    'CodeActAgent': codeact_user_response_mint,
 }
 
 AGENT_CLS_TO_INST_SUFFIX = {
     'CodeActAgent': '\nIMPORTANT: When your answer is confirmed by the user to be correct, you can exit using the following command: <execute_bash> exit </execute_bash>.\n'
 }
 
+with open(os.path.join(os.path.dirname(__file__), 'requirements.txt'), 'r') as f:
+    MINT_DEPENDENCIES = f.read().splitlines()
+
+
+def load_incontext_example(task_name: str, with_tool: bool = True):
+    assert with_tool, 'NOT with_tool is not supported yet'
+    subset = {
+        'gsm8k': 'reasoning',
+        'math': 'reasoning',
+        'mmlu': 'reasoning',
+        'theoremqa': 'reasoning',
+        'mbpp': 'mbpp',
+        'humaneval': 'humaneval',
+    }[task_name]
+    with open(
+        os.path.join(
+            os.path.dirname(__file__),
+            'tasks',
+            'in_context_examples',
+            subset,
+            'with_tool.txt',
+        ),
+        'r',
+    ) as f:
+        return f.read()
+
+
+def get_config(
+    metadata: EvalMetadata,
+) -> AppConfig:
+    config = AppConfig(
+        default_agent=metadata.agent_class,
+        run_as_openhands=False,
+        runtime='eventstream',
+        max_iterations=metadata.max_iterations,
+        sandbox=SandboxConfig(
+            base_container_image='xingyaoww/od-eval-mint:v1.0',
+            enable_auto_lint=True,
+            use_host_network=False,
+            runtime_extra_deps=f'$OH_INTERPRETER_PATH -m pip install {" ".join(MINT_DEPENDENCIES)}',
+        ),
+        # do not mount workspace
+        workspace_base=None,
+        workspace_mount_path=None,
+    )
+    config.set_llm_config(metadata.llm_config)
+    return config
+
+
+def initialize_runtime(runtime: Runtime):
+    """Initialize the runtime for the agent.
+
+    This function is called before the runtime is used to run the agent.
+    """
+    logger.info(f"{'-' * 50} BEGIN Runtime Initialization Fn {'-' * 50}")
+    obs: CmdOutputObservation
+
+    # Set instance id
+    action = CmdRunAction(command='mkdir -p /workspace')
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    assert obs.exit_code == 0
+
+    action = CmdRunAction(command='cd /workspace')
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    assert obs.exit_code == 0
+
+    logger.info(f"{'-' * 50} END Runtime Initialization Fn {'-' * 50}")
+
 
 def process_instance(
-    instance: Task,
-    agent_class,
-    metadata,
-    skip_workspace_mount,
-    eval_output_dir,
+    instance: Any,
+    metadata: EvalMetadata,
     reset_logger: bool = True,
 ):
-    workspace_mount_path = os.path.join(config.workspace_mount_path, '_eval_workspace')
-    # create process-specific workspace dir
-    # if `not skip_workspace_mount` - we will create a workspace directory for EACH process
-    # so that different agent don't interfere with each other.
-    if not skip_workspace_mount:
-        workspace_mount_path = os.path.join(workspace_mount_path, str(os.getpid()))
-        pathlib.Path(workspace_mount_path).mkdir(parents=True, exist_ok=True)
+    config = get_config(metadata)
 
     # Setup the logger properly, so you can run multi-processing to parallelize the evaluation
     if reset_logger:
-        # Set up logger
-        log_file = os.path.join(
-            eval_output_dir, 'logs', f'instance_{instance.task_id}.log'
-        )
-        # Remove all existing handlers from logger
-        for handler in logger.handlers[:]:
-            logger.removeHandler(handler)
-        # add back the console handler to print ONE line
-        logger.addHandler(get_console_handler())
-        logger.info(
-            f'Starting evaluation for instance {instance.task_id}.\nHint: run "tail -f {log_file}" to see live logs in a separate shell'
-        )
-        # Remove all existing handlers from logger
-        for handler in logger.handlers[:]:
-            logger.removeHandler(handler)
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setFormatter(
-            logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        )
-        logger.addHandler(file_handler)
-
-    if not skip_workspace_mount:
-        logger.info(f'Process-specific workspace mounted at {workspace_mount_path}')
-
-    sandbox = DockerSSHBox()
-
-    requirements_host_src = 'evaluation/mint/requirements.txt'
-    requirements_sandbox_dest = '/opendevin/plugins/mint/requirements.txt'
-    sandbox.copy_to(
-        host_src=requirements_host_src,
-        sandbox_dest=requirements_sandbox_dest,
-        recursive=False,
-    )
-    logger.info(
-        f'Copied files from [{requirements_host_src}] to [{requirements_sandbox_dest}] inside sandbox.'
-    )
-    exit_code, output = sandbox.execute(f'pip install -r {requirements_sandbox_dest}')
+        log_dir = os.path.join(metadata.eval_output_dir, 'infer_logs')
+        reset_logger_for_multiprocessing(logger, instance.instance_id, log_dir)
+    else:
+        logger.info(f'Starting evaluation for instance {instance.instance_id}.')
 
     # Prepare instruction
+    assert metadata.details is not None
     instruction = ToolPromptTemplate(use_tool=True)(
-        max_total_steps=metadata['max_iterations'],
-        max_propose_solution=metadata['max_propose_solution'],
-        in_context_example=instance.in_context_example(
-            use_tool=True, with_feedback=False
-        ),
+        max_total_steps=metadata.max_iterations,
+        max_propose_solution=metadata.details['max_propose_solution'],
+        in_context_example=instance.in_context_example,
         task_prompt='Task:\n' + instance.prompt,
     )
     instruction += 'IMPORTANT: You should ONLY interact with the environment provided to you or provide the concise RESULT inside <solution> tag AND NEVER ASK FOR HUMAN HELP.\n'
 
     # NOTE: You can actually set slightly different instruction for different agents
-    instruction += AGENT_CLS_TO_INST_SUFFIX.get(agent_class, '')
+    instruction += AGENT_CLS_TO_INST_SUFFIX[metadata.agent_class]
 
     # Here's how you can run the agent (similar to the `main` function) and get the final task state
     fake_user_response_fn = functools.partial(
-        AGENT_CLS_TO_FAKE_USER_RESPONSE_FN.get(agent_class),
+        AGENT_CLS_TO_FAKE_USER_RESPONSE_FN[metadata.agent_class],
         task=instance,
         task_config={
-            'max_iterations': metadata['max_iterations'],
-            'max_propose_solution': metadata['max_propose_solution'],
+            'max_iterations': metadata.max_iterations,
+            'max_propose_solution': metadata.details['max_propose_solution'],
         },
     )
 
-    state: State = asyncio.run(
-        main(
-            instruction,
+    runtime = create_runtime(config)
+    call_async_from_sync(runtime.connect)
+    initialize_runtime(runtime)
+
+    state: State | None = asyncio.run(
+        run_controller(
+            config=config,
+            initial_user_action=MessageAction(content=instruction),
+            runtime=runtime,
             fake_user_response_fn=fake_user_response_fn,
-            sandbox=sandbox,
         )
     )
 
@@ -166,39 +193,49 @@ def process_instance(
         raise ValueError('State should not be None.')
 
     task_state = None
-    if hasattr(state, 'task_state'):
-        task_state = state.task_state
+    if 'task_state' in state.extra_data:
+        task_state = state.extra_data['task_state']
         logger.info('Task state: ' + str(task_state.to_dict()))
 
     metrics = state.metrics.get() if state.metrics else None
 
+    # history is now available as a stream of events, rather than list of pairs of (Action, Observation)
+    # for compatibility with the existing output format, we can remake the pairs here
+    # remove when it becomes unnecessary
+    histories = state.history.compatibility_for_eval_history_pairs()
+
     # Save the output
-    output = {
-        'id': instance.task_id,
-        'instance': instance.to_dict(),
-        'instruction': instruction,
-        'metadata': metadata,
-        'history': [
-            (event_to_dict(action), event_to_dict(obs)) for action, obs in state.history
-        ],
-        'metrics': metrics,
-        'error': state.error if state and state.error else None,
-        'test_result': task_state.success if task_state else False,
-    }
-
-    # Close the sandbox
-    sandbox.close()
-
+    output = EvalOutput(
+        instance_id=instance.instance_id,
+        instance=instance.to_dict(),
+        instruction=instruction,
+        metadata=metadata,
+        history=histories,
+        metrics=metrics,
+        error=state.last_error if state and state.last_error else None,
+        test_result={
+            'success': task_state.success if task_state else False,
+        },
+    )
     return output
 
 
 if __name__ == '__main__':
     parser = get_parser()
 
+    SUBSETS = [
+        # Eurus subset: https://arxiv.org/abs/2404.02078
+        'math',
+        # 'gsm8k',
+        'mmlu',
+        'theoremqa',
+        'mbpp',
+        'humaneval',
+    ]
     parser.add_argument(
         '--subset',
-        default='math',
-        choices=['math', 'gsm8k', 'mmlu', 'theoremqa', 'mbpp', 'humaneval'],
+        default='all',
+        choices=SUBSETS + ['all'],
         type=str,
         help='subset of the dataset to be used',
     )
@@ -212,151 +249,45 @@ if __name__ == '__main__':
     args, _ = parser.parse_known_args()
 
     # NOTE: It is preferable to load datasets from huggingface datasets and perform post-processing
-    # so we don't need to manage file uploading to OpenDevin's repo
-    mint_dataset = load_dataset(
-        'ryanhoangt/xingyaoww-mint-bench', name=args.subset, split='test'
-    )
-    logger.info(f'Evaluating MINT - {args.subset} subset')
+    # so we don't need to manage file uploading to OpenHands's repo
+    if args.subset == 'all':
+        subsets = SUBSETS
+    else:
+        subsets = [args.subset]
 
-    # Check https://github.com/OpenDevin/OpenDevin/blob/main/evaluation/swe_bench/README.md#configure-opendevin-and-your-llm
-    # for details of how to set `llm_config`
-    if args.llm_config:
-        specified_llm_config = get_llm_config_arg(args.llm_config)
-        if specified_llm_config:
-            config.llm = specified_llm_config
-    logger.info(f'Config for evaluation: {config}')
-
-    # TEST METADATA
-    agent_class = args.agent_cls
-    assert (
-        agent_class in AGENT_CLS_TO_FAKE_USER_RESPONSE_FN
-    ), f'Unsupported agent class: {agent_class}'
-    model_name = config.llm.model.split('/')[-1]
-    max_iterations = args.max_iterations
-    eval_note = ''
-    if args.eval_note is not None:
-        eval_note += '_N_' + args.eval_note
-    eval_output_dir = os.path.join(
-        args.eval_output_dir,
-        'mint',
-        agent_class,
-        model_name + '_maxiter_' + str(max_iterations) + eval_note,
-        args.subset,
-    )
-
-    pathlib.Path(eval_output_dir).mkdir(parents=True, exist_ok=True)
-    pathlib.Path(os.path.join(eval_output_dir, 'logs')).mkdir(
-        parents=True, exist_ok=True
-    )
-    logger.info(f'Using evaluation output directory: {eval_output_dir}')
-
-    metadata = {
-        'agent_class': agent_class,
-        'model_name': model_name,
-        'max_iterations': max_iterations,
-        'max_propose_solution': args.max_propose_solution,
-        'eval_output_dir': eval_output_dir,
-        'start_time': time.strftime('%Y-%m-%d %H:%M:%S'),
-        # get the commit id of current repo for reproducibility
-        'git_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'])
-        .decode('utf-8')
-        .strip(),
-    }
-    logger.info(f'Metadata: {metadata}')
-    with open(os.path.join(eval_output_dir, 'metadata.json'), 'w') as f:
-        json.dump(metadata, f)
-
-    # LIMIT EVALUATION
-    eval_n_limit = args.eval_n_limit
-    if eval_n_limit:
-        mint_dataset = mint_dataset.select(range(eval_n_limit))
-        logger.info(f'Limiting evaluation to first {eval_n_limit} instances.')
-
-    # OUTPUT FILE
-    output_file = os.path.join(eval_output_dir, 'output.jsonl')
-    logger.info(f'Writing evaluation output to {output_file}')
-    finished_instance_ids = set()
-    if os.path.exists(output_file):
-        with open(output_file, 'r') as f:
-            for line in f:
-                data = json.loads(line)
-                finished_instance_ids.add(data['id'])
-        logger.warning(
-            f'Output file {output_file} already exists. Loaded {len(finished_instance_ids)} finished instances.'
+    dataset_dfs = []
+    for subset in subsets:
+        in_context_example = load_incontext_example(subset)
+        _cur_dataset = load_dataset(
+            'ryanhoangt/xingyaoww-mint-bench', name=subset, split='test'
         )
-    output_fp = open(output_file, 'a')
+        logger.info(f'Loaded MINT - {subset} subset')
+        _df = _cur_dataset.to_pandas().rename(columns={'id': 'instance_id'})
+        _df['instance_id'] = _df['instance_id'].apply(lambda x: f'{subset}/{x}')  # noqa
+        _df['in_context_example'] = in_context_example
+        dataset_dfs.append(_df)
+        logger.info(f'Loaded {len(_df)} instances for subset: {subset}')
 
-    logger.info(
-        f'Evaluation started with Agent {agent_class}, model {model_name}, max iterations {max_iterations}, max propose solution {args.max_propose_solution}.'
+    dataset_df = pd.concat(dataset_dfs)
+    logger.info(f'Loaded {len(dataset_df)} instances for subset: {subsets}')
+
+    llm_config = None
+    if args.llm_config:
+        llm_config = get_llm_config_arg(args.llm_config)
+    if llm_config is None:
+        raise ValueError(f'Could not find LLM config: --llm_config {args.llm_config}')
+
+    metadata = make_metadata(
+        llm_config,
+        f'MINT-{args.subset}',
+        args.agent_cls,
+        args.max_iterations,
+        args.eval_note,
+        args.eval_output_dir,
+        details={'max_propose_solution': args.max_propose_solution},
     )
-
-    # =============================================
-    # filter out finished instances
-    task_class: Task = getattr(tasks, TASK_INFO_MAP[args.subset]['class'])
-    new_mint_tests: list[Task] = []
-
-    for instance in mint_dataset:
-        if instance['id'] in finished_instance_ids:
-            logger.info(
-                f'Skipping instance {instance["id"]} as it is already finished.'
-            )
-            continue
-        # convert to Task object
-        instance = task_class(**instance)
-        new_mint_tests.append(instance)
-
-    mint_dataset = new_mint_tests
-    logger.info(
-        f'Finished instances: {len(finished_instance_ids)}, Remaining instances: {len(mint_dataset)}'
+    output_file = os.path.join(metadata.eval_output_dir, 'output.jsonl')
+    instances = prepare_dataset(dataset_df, output_file, args.eval_n_limit)
+    run_evaluation(
+        instances, metadata, output_file, args.eval_num_workers, process_instance
     )
-    # =============================================
-
-    pbar = tqdm(total=len(mint_dataset))
-
-    # This function tracks the progress AND write the output to a JSONL file
-    def update_progress(future):
-        pbar.update(1)
-        output = future.result()
-        # logger.info('Output: ', output)
-        # pbar.set_description(f'Instance {output["instance_id"]}')
-        # pbar.set_postfix_str(f'Test Result: {output["test_result"]["result"]}')
-        # logger.info(
-        #     f'Finished evaluation for instance {output["instance_id"]}: {output["test_result"]["result"]}'
-        # )
-        output_fp.write(json.dumps(output) + '\n')
-        output_fp.flush()
-
-    # This sets the multi-processing
-    num_workers = args.eval_num_workers
-    logger.info(f'Using {num_workers} workers for evaluation.')
-
-    # This is SWE-Bench specific - CodeActAgent doesn't require mounted workspace to work
-    skip_workspace_mount = agent_class == 'CodeActAgent'
-    logger.info(f'Skipping workspace mount: {skip_workspace_mount}')
-
-    try:
-        with ProcessPoolExecutor(num_workers) as executor:
-            futures = []
-            # This is how we perform multi-processing
-            for instance in mint_dataset:
-                future = executor.submit(
-                    process_instance,
-                    instance,
-                    agent_class,
-                    metadata,
-                    skip_workspace_mount,
-                    eval_output_dir,
-                    reset_logger=bool(num_workers > 1),
-                )
-                future.add_done_callback(update_progress)
-                futures.append(future)
-
-            # Wait for all futures to complete
-            for future in futures:
-                future.result()
-    except KeyboardInterrupt:
-        print('KeyboardInterrupt received. Cleaning up...')
-        cleanup()
-
-    output_fp.close()
-    logger.info('Evaluation finished.')

@@ -1,73 +1,159 @@
 import asyncio
 import json
-import logging
 import os
-import pathlib
-import subprocess
-import time
+from typing import Any
 
 import browsergym.webarena  # noqa F401 register webarena tasks as gym environments
 import gymnasium as gym
-from tqdm import tqdm
+import pandas as pd
 
-from opendevin.controller.state.state import State
-from opendevin.core.config import args, config, get_llm_config_arg
-from opendevin.core.logger import get_console_handler
-from opendevin.core.logger import opendevin_logger as logger
-from opendevin.core.main import main
-from opendevin.events.serialization.event import event_to_dict
-from opendevin.runtime.docker.ssh_box import DockerSSHBox
-from opendevin.runtime.tools import RuntimeTool
+from evaluation.utils.shared import (
+    EvalMetadata,
+    EvalOutput,
+    make_metadata,
+    prepare_dataset,
+    reset_logger_for_multiprocessing,
+    run_evaluation,
+)
+from openhands.controller.state.state import State
+from openhands.core.config import (
+    AppConfig,
+    SandboxConfig,
+    get_llm_config_arg,
+    parse_arguments,
+)
+from openhands.core.logger import openhands_logger as logger
+from openhands.core.main import create_runtime, run_controller
+from openhands.events.action import (
+    BrowseInteractiveAction,
+    CmdRunAction,
+    MessageAction,
+)
+from openhands.events.observation import CmdOutputObservation
+from openhands.runtime.base import Runtime
+from openhands.runtime.browser.browser_env import (
+    BROWSER_EVAL_GET_GOAL_ACTION,
+    BROWSER_EVAL_GET_REWARDS_ACTION,
+)
+from openhands.utils.async_utils import call_async_from_sync
 
 SUPPORTED_AGENT_CLS = {'BrowsingAgent'}
 
 
-def process_instance(
+def get_config(
+    metadata: EvalMetadata,
     env_id: str,
-    metadata: dict,
-    eval_output_dir: str,
-    docker_sandbox: DockerSSHBox,
+) -> AppConfig:
+    base_url = os.environ.get('WEBARENA_BASE_URL', None)
+    openai_api_key = os.environ.get('OPENAI_API_KEY', None)
+    assert base_url is not None, 'WEBARENA_BASE_URL must be set'
+    assert openai_api_key is not None, 'OPENAI_API_KEY must be set'
+
+    config = AppConfig(
+        default_agent=metadata.agent_class,
+        run_as_openhands=False,
+        runtime='eventstream',
+        max_iterations=metadata.max_iterations,
+        sandbox=SandboxConfig(
+            base_container_image='python:3.12-bookworm',
+            enable_auto_lint=True,
+            use_host_network=False,
+            browsergym_eval_env=env_id,
+            runtime_startup_env_vars={
+                'BASE_URL': base_url,
+                'OPENAI_API_KEY': openai_api_key,
+                'SHOPPING': f'{base_url}:7770/',
+                'SHOPPING_ADMIN': f'{base_url}:7780/admin',
+                'REDDIT': f'{base_url}:9999',
+                'GITLAB': f'{base_url}:8023',
+                'WIKIPEDIA': f'{base_url}:8888/wikipedia_en_all_maxi_2022-05/A/User:The_other_Kiwix_guy/Landing',
+                'MAP': f'{base_url}:3000',
+                'HOMEPAGE': f'{base_url}:4399',
+            },
+        ),
+        # do not mount workspace
+        workspace_base=None,
+        workspace_mount_path=None,
+    )
+    config.set_llm_config(metadata.llm_config)
+    return config
+
+
+def initialize_runtime(
+    runtime: Runtime,
+) -> dict:
+    """Initialize the runtime for the agent.
+
+    This function is called before the runtime is used to run the agent.
+    """
+    logger.info(f"{'-' * 50} BEGIN Runtime Initialization Fn {'-' * 50}")
+    obs: CmdOutputObservation
+
+    # Set instance id
+    action = CmdRunAction(command='mkdir -p /workspace')
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    assert obs.exit_code == 0
+
+    action = BrowseInteractiveAction(browser_actions=BROWSER_EVAL_GET_GOAL_ACTION)
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+    goal = obs.content
+
+    logger.info(f"{'-' * 50} END Runtime Initialization Fn {'-' * 50}")
+    return goal
+
+
+def complete_runtime(
+    runtime: Runtime,
+) -> dict[str, Any]:
+    """Complete the runtime for the agent.
+
+    This function is called before the runtime is used to run the agent.
+    If you need to do something in the sandbox to get the correctness metric after
+    the agent has run, modify this function.
+    """
+    logger.info(f"{'-' * 50} BEGIN Runtime Completion Fn {'-' * 50}")
+    obs: CmdOutputObservation
+
+    action = BrowseInteractiveAction(browser_actions=BROWSER_EVAL_GET_REWARDS_ACTION)
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+
+    logger.info(f"{'-' * 50} END Runtime Completion Fn {'-' * 50}")
+    return {
+        'rewards': json.loads(obs.content),
+    }
+
+
+def process_instance(
+    instance: pd.Series,
+    metadata: EvalMetadata,
     reset_logger: bool = True,
 ):
+    env_id = instance.instance_id
+    config = get_config(metadata, env_id)
+
     # Setup the logger properly, so you can run multi-processing to parallelize the evaluation
     if reset_logger:
-        # Set up logger
-        log_file = os.path.join(eval_output_dir, 'logs', f'instance_{env_id}.log')
-        # Remove all existing handlers from logger
-        for handler in logger.handlers[:]:
-            logger.removeHandler(handler)
-        # add back the console handler to print ONE line
-        logger.addHandler(get_console_handler())
-        logger.info(
-            f'Starting evaluation for instance {env_id}.\nHint: run "tail -f {log_file}" to see live logs in a separate shell'
-        )
-        # Remove all existing handlers from logger
-        for handler in logger.handlers[:]:
-            logger.removeHandler(handler)
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setFormatter(
-            logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        )
-        logger.addHandler(file_handler)
+        log_dir = os.path.join(metadata.eval_output_dir, 'infer_logs')
+        reset_logger_for_multiprocessing(logger, env_id, log_dir)
     else:
         logger.info(f'Starting evaluation for instance {env_id}.')
 
-    # Here's how you can run the agent (similar to the `main` function) and get the final task state
-    runtime_tools_config = {
-        RuntimeTool.BROWSER: {
-            'browsergym_eval': env_id,
-            'browsergym_eval_save_dir': eval_output_dir,
-        }
-    }
+    runtime = create_runtime(config)
+    call_async_from_sync(runtime.connect)
+    task_str = initialize_runtime(runtime)
 
-    state: State = asyncio.run(
-        main(
-            'PLACEHOLDER_GOAL',
-            runtime_tools_config=runtime_tools_config,
-            sandbox=docker_sandbox,
+    state: State | None = asyncio.run(
+        run_controller(
+            config=config,
+            initial_user_action=MessageAction(content=task_str),
+            runtime=runtime,
         )
     )
-
     # ======= Attempt to evaluate the agent's environment impact =======
 
     # If you are working on some simpler benchmark that only evaluates the final model output (e.g., in a MessageAction)
@@ -77,138 +163,72 @@ def process_instance(
         raise ValueError('State should not be None.')
 
     metrics = state.metrics.get() if state.metrics else None
-    browsergym_eval_dir = os.path.join(eval_output_dir, env_id.split('/')[1])
-    # read goal
-    with open(
-        os.path.join(browsergym_eval_dir, 'goal.txt'), 'r', encoding='utf-8'
-    ) as f:
-        instruction = f.read()
-    # read reward
-    with open(
-        os.path.join(browsergym_eval_dir, 'rewards.json'), 'r', encoding='utf-8'
-    ) as f:
-        rewards = json.load(f)
-        reward = max(rewards)
+
+    # Instruction is the first message from the USER
+    instruction = ''
+    for event in state.history.get_events():
+        if isinstance(event, MessageAction):
+            instruction = event.content
+            break
+
+    return_val = complete_runtime(runtime)
+    logger.info(f'Return value from complete_runtime: {return_val}')
+    reward = max(return_val['rewards'])
+
+    # history is now available as a stream of events, rather than list of pairs of (Action, Observation)
+    # for compatibility with the existing output format, we can remake the pairs here
+    # remove when it becomes unnecessary
+    histories = state.history.compatibility_for_eval_history_pairs()
 
     # Save the output
-    output = {
-        'instance_id': env_id,
-        'instruction': instruction,
-        'metadata': metadata,
-        'history': [
-            (event_to_dict(action), event_to_dict(obs)) for action, obs in state.history
-        ],
-        'metrics': metrics,
-        'error': state.error if state and state.error else None,
-        'test_result': reward,
-    }
-
+    output = EvalOutput(
+        instance_id=env_id,
+        instruction=instruction,
+        metadata=metadata,
+        history=histories,
+        metrics=metrics,
+        error=state.last_error if state and state.last_error else None,
+        test_result={
+            'reward': reward,
+        },
+    )
     return output
 
 
 if __name__ == '__main__':
-    env_ids = [
-        id for id in gym.envs.registry.keys() if id.startswith('browsergym/webarena')
-    ]
+    args = parse_arguments()
 
-    # Check https://github.com/OpenDevin/OpenDevin/blob/main/evaluation/swe_bench/README.md#configure-opendevin-and-your-llm
-    # for details of how to set `llm_config`
+    dataset = pd.DataFrame(
+        {
+            'instance_id': [
+                id
+                for id in gym.envs.registry.keys()
+                if id.startswith('browsergym/webarena')
+            ]
+        }
+    )
+
+    llm_config = None
     if args.llm_config:
-        specified_llm_config = get_llm_config_arg(args.llm_config)
-        if specified_llm_config:
-            config.llm = specified_llm_config
-    logger.info(f'Config for evaluation: {config}')
+        llm_config = get_llm_config_arg(args.llm_config)
+    if llm_config is None:
+        raise ValueError(f'Could not find LLM config: --llm_config {args.llm_config}')
 
-    # TEST METADATA
-    agent_class = args.agent_cls
-    assert agent_class in SUPPORTED_AGENT_CLS, f'Unsupported agent class: {agent_class}'
-    model_name = config.llm.model.split('/')[-1]
-    max_iterations = args.max_iterations
-    eval_note = ''
-    if args.eval_note is not None:
-        eval_note += '_N_' + args.eval_note
-    eval_output_dir = os.path.join(
+    metadata = make_metadata(
+        llm_config,
+        args.dataset_name,
+        args.agent_cls,
+        args.max_iterations,
+        args.eval_note,
         args.eval_output_dir,
-        'webarena',
-        agent_class,
-        model_name + '_maxiter_' + str(max_iterations) + eval_note,
     )
+    output_file = os.path.join(metadata.eval_output_dir, 'output.jsonl')
+    instances = prepare_dataset(dataset, output_file, args.eval_n_limit)
 
-    pathlib.Path(eval_output_dir).mkdir(parents=True, exist_ok=True)
-    pathlib.Path(os.path.join(eval_output_dir, 'logs')).mkdir(
-        parents=True, exist_ok=True
+    run_evaluation(
+        instances,
+        metadata,
+        output_file,
+        args.eval_num_workers,
+        process_instance,
     )
-    logger.info(f'Using evaluation output directory: {eval_output_dir}')
-
-    metadata = {
-        'agent_class': agent_class,
-        'model_name': model_name,
-        'max_iterations': max_iterations,
-        'eval_output_dir': eval_output_dir,
-        'start_time': time.strftime('%Y-%m-%d %H:%M:%S'),
-        # get the commit id of current repo for reproducibility
-        'git_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'])
-        .decode('utf-8')
-        .strip(),
-    }
-    logger.info(f'Metadata: {metadata}')
-    with open(os.path.join(eval_output_dir, 'metadata.json'), 'w') as f:
-        json.dump(metadata, f)
-
-    # LIMIT EVALUATION
-    eval_n_limit = args.eval_n_limit
-    if eval_n_limit:
-        env_ids = env_ids[:eval_n_limit]
-        logger.info(f'Limiting evaluation to first {eval_n_limit} instances.')
-
-    # OUTPUT FILE
-    output_file = os.path.join(eval_output_dir, 'output.jsonl')
-    logger.info(f'Writing evaluation output to {output_file}')
-    finished_instance_ids = set()
-    if os.path.exists(output_file):
-        with open(output_file, 'r') as f:
-            for line in f:
-                data = json.loads(line)
-                finished_instance_ids.add(data['instance_id'])
-        logger.warning(
-            f'Output file {output_file} already exists. Loaded {len(finished_instance_ids)} finished instances.'
-        )
-    output_fp = open(output_file, 'a')
-
-    logger.info(
-        f'Evaluation started with Agent {agent_class}, model {model_name}, max iterations {max_iterations}.'
-    )
-
-    # =============================================
-    # filter out finished instances
-    new_env_ids = []
-    for idx in env_ids:
-        if idx in finished_instance_ids:
-            logger.info(f'Skipping instance {idx} as it is already finished.')
-            continue
-        new_env_ids.append(idx)
-
-    env_ids = new_env_ids
-    logger.info(
-        f'Finished instances: {len(finished_instance_ids)}, Remaining instances: {len(env_ids)}'
-    )
-
-    # =============================================
-
-    docker_sandbox = DockerSSHBox()
-    for env_id in tqdm(env_ids):
-        try:
-            output = process_instance(
-                env_id=env_id,
-                metadata=metadata,
-                eval_output_dir=eval_output_dir,
-                docker_sandbox=docker_sandbox,
-                reset_logger=False,
-            )
-            output_fp.write(json.dumps(output) + '\n')
-            output_fp.flush()
-        except Exception as e:
-            logger.error(f'Error processing instance {env_id}: {e}')
-
-    output_fp.close()
-    logger.info('Evaluation finished.')

@@ -1,42 +1,85 @@
 import contextlib
 import io
-import os
 import sys
 
 import docx
 import pytest
 
-from opendevin.runtime.plugins.agent_skills.agentskills import (
-    MSG_FILE_UPDATED,
+from openhands.runtime.plugins.agent_skills.agentskills import file_editor
+from openhands.runtime.plugins.agent_skills.file_ops.file_ops import (
+    WINDOW,
     _print_window,
-    append_file,
-    create_file,
-    edit_file,
     find_file,
     goto_line,
     open_file,
-    parse_docx,
-    parse_latex,
-    parse_pdf,
-    parse_pptx,
     scroll_down,
     scroll_up,
     search_dir,
     search_file,
+)
+from openhands.runtime.plugins.agent_skills.file_reader.file_readers import (
+    parse_docx,
+    parse_latex,
+    parse_pdf,
+    parse_pptx,
 )
 
 
 # CURRENT_FILE must be reset for each test
 @pytest.fixture(autouse=True)
 def reset_current_file():
-    from opendevin.runtime.plugins.agent_skills import agentskills
+    from openhands.runtime.plugins.agent_skills import agentskills
 
     agentskills.CURRENT_FILE = None
 
 
+def _numbered_test_lines(start, end) -> str:
+    return ('\n'.join(f'{i}|' for i in range(start, end + 1))) + '\n'
+
+
+def _generate_test_file_with_lines(temp_path, num_lines) -> str:
+    file_path = temp_path / 'test_file.py'
+    file_path.write_text('\n' * num_lines)
+    return file_path
+
+
+def _generate_ruby_test_file_with_lines(temp_path, num_lines) -> str:
+    file_path = temp_path / 'test_file.rb'
+    file_path.write_text('\n' * num_lines)
+    return file_path
+
+
+def _calculate_window_bounds(current_line, total_lines, window_size):
+    """Calculate the bounds of the window around the current line."""
+    half_window = window_size // 2
+    if current_line - half_window < 0:
+        start = 1
+        end = window_size
+    else:
+        start = current_line - half_window
+        end = current_line + half_window
+    return start, end
+
+
+def _capture_file_operation_error(operation, expected_error_msg):
+    with io.StringIO() as buf:
+        with contextlib.redirect_stdout(buf):
+            operation()
+        result = buf.getvalue().strip()
+    assert result == expected_error_msg
+
+
+SEP = '-' * 49 + '\n'
+
+
+# =============================================================================
+
+
 def test_open_file_unexist_path():
-    with pytest.raises(FileNotFoundError):
-        open_file('/unexist/path/a.txt')
+    _capture_file_operation_error(
+        lambda: open_file('/unexist/path/a.txt'),
+        'ERROR: File /unexist/path/a.txt not found.',
+    )
 
 
 def test_open_file(tmp_path):
@@ -51,11 +94,13 @@ def test_open_file(tmp_path):
     assert result is not None
     expected = (
         f'[File: {temp_file_path} (5 lines total)]\n'
+        '(this is the beginning of the file)\n'
         '1|Line 1\n'
         '2|Line 2\n'
         '3|Line 3\n'
         '4|Line 4\n'
         '5|Line 5\n'
+        '(this is the end of the file)\n'
     )
     assert result.split('\n') == expected.split('\n')
 
@@ -71,11 +116,13 @@ def test_open_file_with_indentation(tmp_path):
     assert result is not None
     expected = (
         f'[File: {temp_file_path} (5 lines total)]\n'
+        '(this is the beginning of the file)\n'
         '1|Line 1\n'
         '2|    Line 2\n'
         '3|Line 3\n'
         '4|Line 4\n'
         '5|Line 5\n'
+        '(this is the end of the file)\n'
     )
     assert result.split('\n') == expected.split('\n')
 
@@ -87,13 +134,15 @@ def test_open_file_long(tmp_path):
 
     with io.StringIO() as buf:
         with contextlib.redirect_stdout(buf):
-            open_file(str(temp_file_path))
+            open_file(str(temp_file_path), 1, 50)
         result = buf.getvalue()
     assert result is not None
     expected = f'[File: {temp_file_path} (1000 lines total)]\n'
-    for i in range(1, 52):
+    expected += '(this is the beginning of the file)\n'
+    for i in range(1, 51):
         expected += f'{i}|Line {i}\n'
-    expected += '(949 more lines below)\n'
+    expected += '(950 more lines below)\n'
+    expected += '[Use `scroll_down` to view the next 100 lines of the file!]\n'
     assert result.split('\n') == expected.split('\n')
 
 
@@ -102,42 +151,35 @@ def test_open_file_long_with_lineno(tmp_path):
     content = '\n'.join([f'Line {i}' for i in range(1, 1001)])
     temp_file_path.write_text(content)
 
+    cur_line = 100
+
     with io.StringIO() as buf:
         with contextlib.redirect_stdout(buf):
-            open_file(str(temp_file_path), 100)
+            open_file(str(temp_file_path), cur_line)
         result = buf.getvalue()
     assert result is not None
     expected = f'[File: {temp_file_path} (1000 lines total)]\n'
-    expected += '(50 more lines above)\n'
-    for i in range(51, 151):
+    # since 100 is < WINDOW and 100 - WINDOW//2 < 0, so it should show all lines from 1 to WINDOW
+
+    start, end = _calculate_window_bounds(cur_line, 1000, WINDOW)
+    if start == 1:
+        expected += '(this is the beginning of the file)\n'
+    else:
+        expected += f'({start - 1} more lines above)\n'
+    for i in range(start, end + 1):
         expected += f'{i}|Line {i}\n'
-    expected += '(850 more lines below)\n'
-    assert result.split('\n') == expected.split('\n')
-
-
-def test_create_file_unexist_path():
-    with pytest.raises(FileNotFoundError):
-        create_file('/unexist/path/a.txt')
-
-
-def test_create_file(tmp_path):
-    temp_file_path = tmp_path / 'a.txt'
-    with io.StringIO() as buf:
-        with contextlib.redirect_stdout(buf):
-            create_file(str(temp_file_path))
-        result = buf.getvalue()
-
-    expected = (
-        f'[File: {temp_file_path} (1 lines total)]\n'
-        '1|\n'
-        f'[File {temp_file_path} created.]\n'
-    )
+    if end == 1000:
+        expected += '(this is the end of the file)\n'
+    else:
+        expected += f'({1000 - end} more lines below)\n'
+        expected += '[Use `scroll_down` to view the next 100 lines of the file!]\n'
     assert result.split('\n') == expected.split('\n')
 
 
 def test_goto_line(tmp_path):
     temp_file_path = tmp_path / 'a.txt'
-    content = '\n'.join([f'Line {i}' for i in range(1, 1001)])
+    total_lines = 1000
+    content = '\n'.join([f'Line {i}' for i in range(1, total_lines + 1)])
     temp_file_path.write_text(content)
 
     with io.StringIO() as buf:
@@ -146,23 +188,33 @@ def test_goto_line(tmp_path):
         result = buf.getvalue()
     assert result is not None
 
-    expected = f'[File: {temp_file_path} (1000 lines total)]\n'
-    for i in range(1, 52):
+    expected = f'[File: {temp_file_path} ({total_lines} lines total)]\n'
+    expected += '(this is the beginning of the file)\n'
+    for i in range(1, WINDOW + 1):
         expected += f'{i}|Line {i}\n'
-    expected += '(949 more lines below)\n'
+    expected += f'({total_lines - WINDOW} more lines below)\n'
+    expected += '[Use `scroll_down` to view the next 100 lines of the file!]\n'
     assert result.split('\n') == expected.split('\n')
 
     with io.StringIO() as buf:
         with contextlib.redirect_stdout(buf):
-            goto_line(100)
+            goto_line(500)
         result = buf.getvalue()
     assert result is not None
 
-    expected = f'[File: {temp_file_path} (1000 lines total)]\n'
-    expected += '(50 more lines above)\n'
-    for i in range(51, 151):
+    cur_line = 500
+    expected = f'[File: {temp_file_path} ({total_lines} lines total)]\n'
+    start, end = _calculate_window_bounds(cur_line, total_lines, WINDOW)
+    if start == 1:
+        expected += '(this is the beginning of the file)\n'
+    else:
+        expected += f'({start - 1} more lines above)\n'
+    for i in range(start, end + 1):
         expected += f'{i}|Line {i}\n'
-    expected += '(850 more lines below)\n'
+    if end == total_lines:
+        expected += '(this is the end of the file)\n'
+    else:
+        expected += f'({total_lines - end} more lines below)\n'
     assert result.split('\n') == expected.split('\n')
 
 
@@ -174,25 +226,30 @@ def test_goto_line_negative(tmp_path):
     with io.StringIO() as buf:
         with contextlib.redirect_stdout(buf):
             open_file(str(temp_file_path))
-    with pytest.raises(ValueError):
-        goto_line(-1)
+
+    _capture_file_operation_error(
+        lambda: goto_line(-1), 'ERROR: Line number must be between 1 and 4.'
+    )
 
 
 def test_goto_line_out_of_bound(tmp_path):
     temp_file_path = tmp_path / 'a.txt'
-    content = '\n'.join([f'Line {i}' for i in range(1, 5)])
+    content = '\n'.join([f'Line {i}' for i in range(1, 10)])
     temp_file_path.write_text(content)
 
     with io.StringIO() as buf:
         with contextlib.redirect_stdout(buf):
             open_file(str(temp_file_path))
-    with pytest.raises(ValueError):
-        goto_line(100)
+
+    _capture_file_operation_error(
+        lambda: goto_line(100), 'ERROR: Line number must be between 1 and 9.'
+    )
 
 
 def test_scroll_down(tmp_path):
     temp_file_path = tmp_path / 'a.txt'
-    content = '\n'.join([f'Line {i}' for i in range(1, 1001)])
+    total_lines = 1000
+    content = '\n'.join([f'Line {i}' for i in range(1, total_lines + 1)])
     temp_file_path.write_text(content)
 
     with io.StringIO() as buf:
@@ -201,10 +258,19 @@ def test_scroll_down(tmp_path):
         result = buf.getvalue()
     assert result is not None
 
-    expected = f'[File: {temp_file_path} (1000 lines total)]\n'
-    for i in range(1, 52):
+    expected = f'[File: {temp_file_path} ({total_lines} lines total)]\n'
+    start, end = _calculate_window_bounds(1, total_lines, WINDOW)
+    if start == 1:
+        expected += '(this is the beginning of the file)\n'
+    else:
+        expected += f'({start - 1} more lines above)\n'
+    for i in range(start, end + 1):
         expected += f'{i}|Line {i}\n'
-    expected += '(949 more lines below)\n'
+    if end == total_lines:
+        expected += '(this is the end of the file)\n'
+    else:
+        expected += f'({total_lines - end} more lines below)\n'
+        expected += '[Use `scroll_down` to view the next 100 lines of the file!]\n'
     assert result.split('\n') == expected.split('\n')
 
     with io.StringIO() as buf:
@@ -213,30 +279,48 @@ def test_scroll_down(tmp_path):
         result = buf.getvalue()
     assert result is not None
 
-    expected = f'[File: {temp_file_path} (1000 lines total)]\n'
-    expected += '(51 more lines above)\n'
-    for i in range(52, 152):
+    expected = f'[File: {temp_file_path} ({total_lines} lines total)]\n'
+    start = WINDOW + 1
+    end = 2 * WINDOW + 1
+    if start == 1:
+        expected += '(this is the beginning of the file)\n'
+    else:
+        expected += f'({start - 1} more lines above)\n'
+    for i in range(start, end + 1):
         expected += f'{i}|Line {i}\n'
-    expected += '(849 more lines below)\n'
+    if end == total_lines:
+        expected += '(this is the end of the file)\n'
+    else:
+        expected += f'({total_lines - end} more lines below)\n'
     assert result.split('\n') == expected.split('\n')
 
 
 def test_scroll_up(tmp_path):
     temp_file_path = tmp_path / 'a.txt'
-    content = '\n'.join([f'Line {i}' for i in range(1, 1001)])
+    total_lines = 1000
+    content = '\n'.join([f'Line {i}' for i in range(1, total_lines + 1)])
     temp_file_path.write_text(content)
 
+    cur_line = 300
     with io.StringIO() as buf:
         with contextlib.redirect_stdout(buf):
-            open_file(str(temp_file_path), 300)
+            open_file(str(temp_file_path), cur_line)
         result = buf.getvalue()
     assert result is not None
 
-    expected = f'[File: {temp_file_path} (1000 lines total)]\n'
-    expected += '(250 more lines above)\n'
-    for i in range(251, 351):
+    expected = f'[File: {temp_file_path} ({total_lines} lines total)]\n'
+    start, end = _calculate_window_bounds(cur_line, total_lines, WINDOW)
+    if start == 1:
+        expected += '(this is the beginning of the file)\n'
+    else:
+        expected += f'({start - 1} more lines above)\n'
+    for i in range(start, end + 1):
         expected += f'{i}|Line {i}\n'
-    expected += '(650 more lines below)\n'
+    if end == total_lines:
+        expected += '(this is the end of the file)\n'
+    else:
+        expected += f'({total_lines - end} more lines below)\n'
+        expected += '[Use `scroll_down` to view the next 100 lines of the file!]\n'
     assert result.split('\n') == expected.split('\n')
 
     with io.StringIO() as buf:
@@ -245,11 +329,22 @@ def test_scroll_up(tmp_path):
         result = buf.getvalue()
     assert result is not None
 
-    expected = f'[File: {temp_file_path} (1000 lines total)]\n'
-    expected += '(150 more lines above)\n'
-    for i in range(151, 251):
+    cur_line = cur_line - WINDOW
+
+    expected = f'[File: {temp_file_path} ({total_lines} lines total)]\n'
+    start = cur_line
+    end = cur_line + WINDOW
+
+    if start == 1:
+        expected += '(this is the beginning of the file)\n'
+    else:
+        expected += f'({start - 1} more lines above)\n'
+    for i in range(start, end + 1):
         expected += f'{i}|Line {i}\n'
-    expected += '(750 more lines below)\n'
+    if end == total_lines:
+        expected += '(this is the end of the file)\n'
+    else:
+        expected += f'({total_lines - end} more lines below)\n'
     assert result.split('\n') == expected.split('\n')
 
 
@@ -265,8 +360,10 @@ def test_scroll_down_edge(tmp_path):
     assert result is not None
 
     expected = f'[File: {temp_file_path} (9 lines total)]\n'
+    expected += '(this is the beginning of the file)\n'
     for i in range(1, 10):
         expected += f'{i}|Line {i}\n'
+    expected += '(this is the end of the file)\n'
 
     with io.StringIO() as buf:
         with contextlib.redirect_stdout(buf):
@@ -280,7 +377,7 @@ def test_scroll_down_edge(tmp_path):
 
 def test_print_window_internal(tmp_path):
     test_file_path = tmp_path / 'a.txt'
-    create_file(str(test_file_path))
+    test_file_path.write_text('')
     open_file(str(test_file_path))
     with open(test_file_path, 'w') as file:
         for i in range(1, 101):
@@ -296,7 +393,8 @@ def test_print_window_internal(tmp_path):
             _print_window(str(test_file_path), current_line, window, return_str=False)
         result = buf.getvalue()
         expected = (
-            '(49 more lines above)\n'
+            '(48 more lines above)\n'
+            '49|Line `49`\n'
             '50|Line `50`\n'
             '51|Line `51`\n'
             '(49 more lines below)\n'
@@ -304,349 +402,31 @@ def test_print_window_internal(tmp_path):
         assert result == expected
 
 
-def test_edit_file_window(tmp_path, monkeypatch):
-    # Set environment variable via monkeypatch does NOT work!
-    monkeypatch.setattr(
-        'opendevin.runtime.plugins.agent_skills.agentskills.ENABLE_AUTO_LINT', True
-    )
+def test_open_file_large_line_number(tmp_path):
+    test_file_path = tmp_path / 'a.txt'
+    test_file_path.write_text('')
+    open_file(str(test_file_path))
+    with open(test_file_path, 'w') as file:
+        for i in range(1, 1000):
+            file.write(f'Line `{i}`\n')
 
-    content = """def any_int(a, b, c):
-    return isinstance(a, int) and isinstance(b, int) and isinstance(c, int)
+    # Define the parameters for the test
+    current_line = 800
+    window = 100
 
-def test_any_int():
-    assert any_int(1, 2, 3) == True
-    assert any_int(1.5, 2, 3) == False
-    assert any_int(1, 2.5, 3) == False
-    assert any_int(1, 2, 3.5) == False
-    assert any_int(1.0, 2, 3) == False
-    assert any_int(1, 2.0, 3) == False
-    assert any_int(1, 2, 3.0) == False
-    assert any_int(0, 0, 0) == True
-    assert any_int(-1, -2, -3) == True
-    assert any_int(1, -2, 3) == True
-    assert any_int(1.5, -2, 3) == False
-    assert any_int(1, -2.5, 3) == False
-
-def check(any_int):
-    # Check some simple cases
-    assert any_int(2, 3, 1)==True, "This prints if this assert fails 1 (good for debugging!)"
-    assert any_int(2.5, 2, 3)==False, "This prints if this assert fails 2 (good for debugging!)"
-    assert any_int(1.5, 5, 3.5)==False, "This prints if this assert fails 3 (good for debugging!)"
-    assert any_int(2, 6, 2)==False, "This prints if this assert fails 4 (good for debugging!)"
-    assert any_int(4, 2, 2)==True, "This prints if this assert fails 5 (good for debugging!)"
-    assert any_int(2.2, 2.2, 2.2)==False, "This prints if this assert fails 6 (good for debugging!)"
-    assert any_int(-4, 6, 2)==True, "This prints if this assert fails 7 (good for debugging!)"
-
-    # Check some edge cases that are easy to work out by hand.
-    assert any_int(2,1,1)==True, "This prints if this assert fails 8 (also good for debugging!)"
-    assert any_int(3,4,7)==True, "This prints if this assert fails 9 (also good for debugging!)"
-    assert any_int(3.0,4,7)==False, "This prints if this assert fails 10 (also good for debugging!)"
-
-check(any_int)"""
-
-    temp_file_path = tmp_path / 'error-test.py'
-    temp_file_path.write_text(content)
-
-    open_file(str(temp_file_path))
-
+    # Test _print_window especially with backticks
     with io.StringIO() as buf:
         with contextlib.redirect_stdout(buf):
-            edit_file(
-                str(temp_file_path),
-                start=9,
-                end=9,
-                content='        assert any_int(1.0, 2, 3) == False',
-            )
+            # _print_window(str(test_file_path), current_line, window, return_str=False)
+            open_file(str(test_file_path), current_line, window)
         result = buf.getvalue()
-        expected = (
-            '[Your proposed edit has introduced new syntax error(s). Please understand the errors and retry your edit command.]\n'
-            'ERRORS:\n'
-            + str(temp_file_path)
-            + ':9:9: '
-            + 'E999 IndentationError: unexpected indent\n'
-            '[This is how your edit would have looked if applied]\n'
-            '-------------------------------------------------\n'
-            '(4 more lines above)\n'
-            '5|    assert any_int(1, 2, 3) == True\n'
-            '6|    assert any_int(1.5, 2, 3) == False\n'
-            '7|    assert any_int(1, 2.5, 3) == False\n'
-            '8|    assert any_int(1, 2, 3.5) == False\n'
-            '9|        assert any_int(1.0, 2, 3) == False\n'
-            '10|    assert any_int(1, 2.0, 3) == False\n'
-            '11|    assert any_int(1, 2, 3.0) == False\n'
-            '12|    assert any_int(0, 0, 0) == True\n'
-            '13|    assert any_int(-1, -2, -3) == True\n'
-            '14|    assert any_int(1, -2, 3) == True\n'
-            '(19 more lines below)\n'
-            '-------------------------------------------------\n'
-            '\n'
-            '[This is the original code before your edit]\n'
-            '-------------------------------------------------\n'
-            '(4 more lines above)\n'
-            '5|    assert any_int(1, 2, 3) == True\n'
-            '6|    assert any_int(1.5, 2, 3) == False\n'
-            '7|    assert any_int(1, 2.5, 3) == False\n'
-            '8|    assert any_int(1, 2, 3.5) == False\n'
-            '9|    assert any_int(1.0, 2, 3) == False\n'
-            '10|    assert any_int(1, 2.0, 3) == False\n'
-            '11|    assert any_int(1, 2, 3.0) == False\n'
-            '12|    assert any_int(0, 0, 0) == True\n'
-            '13|    assert any_int(-1, -2, -3) == True\n'
-            '14|    assert any_int(1, -2, 3) == True\n'
-            '(19 more lines below)\n'
-            '-------------------------------------------------\n'
-            'Your changes have NOT been applied. Please fix your edit command and try again.\n'
-            'You either need to 1) Specify the correct start/end line arguments or 2) Correct your edit code.\n'
-            'DO NOT re-run the same failed edit command. Running it again will lead to the same error.\n'
-        )
+        expected = f'[File: {test_file_path} (999 lines total)]\n'
+        expected += '(749 more lines above)\n'
+        for i in range(750, 850 + 1):
+            expected += f'{i}|Line `{i}`\n'
+        expected += '(149 more lines below)\n'
+        expected += '[Use `scroll_down` to view the next 100 lines of the file!]\n'
         assert result == expected
-
-
-def test_append_file(tmp_path):
-    temp_file_path = tmp_path / 'a.txt'
-    content = 'Line 1\nLine 2'
-    temp_file_path.write_text(content)
-
-    open_file(str(temp_file_path))
-
-    with io.StringIO() as buf:
-        with contextlib.redirect_stdout(buf):
-            append_file(str(temp_file_path), content='APPENDED TEXT')
-        result = buf.getvalue()
-        expected = (
-            f'[File: {temp_file_path} (3 lines total after edit)]\n'
-            '1|Line 1\n'
-            '2|Line 2\n'
-            '3|APPENDED TEXT\n'
-            '[File updated. Please review the changes and make sure they are correct (correct indentation, no duplicate lines, etc). Edit the file again if necessary.]\n'
-        )
-        assert result.split('\n') == expected.split('\n')
-
-    with open(temp_file_path, 'r') as file:
-        lines = file.readlines()
-    assert len(lines) == 3
-    assert lines[0].rstrip() == 'Line 1'
-    assert lines[1].rstrip() == 'Line 2'
-    assert lines[2].rstrip() == 'APPENDED TEXT'
-
-
-def test_append_file_from_scratch(tmp_path):
-    temp_file_path = tmp_path / 'a.txt'
-    create_file(str(temp_file_path))
-    try:
-        open_file(str(temp_file_path))
-        with io.StringIO() as buf:
-            with contextlib.redirect_stdout(buf):
-                append_file(str(temp_file_path), content='APPENDED TEXT')
-            result = buf.getvalue()
-            expected = (
-                f'[File: {temp_file_path} (1 lines total after edit)]\n'
-                '1|APPENDED TEXT\n'
-                '[File updated. Please review the changes and make sure they are correct (correct indentation, no duplicate lines, etc). Edit the file again if necessary.]\n'
-            )
-            assert result.split('\n') == expected.split('\n')
-
-        with open(temp_file_path, 'r') as file:
-            lines = file.readlines()
-        assert len(lines) == 1
-        assert lines[0].rstrip() == 'APPENDED TEXT'
-    finally:
-        os.remove(temp_file_path)
-
-
-def test_append_file_from_scratch_multiline(tmp_path):
-    temp_file_path = tmp_path / 'a3.txt'
-    create_file(str(temp_file_path))
-    try:
-        open_file(temp_file_path)
-        with io.StringIO() as buf:
-            with contextlib.redirect_stdout(buf):
-                append_file(
-                    str(temp_file_path),
-                    content='APPENDED TEXT1\nAPPENDED TEXT2\nAPPENDED TEXT3',
-                )
-            result = buf.getvalue()
-            expected = (
-                f'[File: {temp_file_path} (3 lines total after edit)]\n'
-                '1|APPENDED TEXT1\n'
-                '2|APPENDED TEXT2\n'
-                '3|APPENDED TEXT3\n'
-                '[File updated. Please review the changes and make sure they are correct (correct indentation, no duplicate lines, etc). Edit the file again if necessary.]\n'
-            )
-            assert result.split('\n') == expected.split('\n')
-
-        with open(temp_file_path, 'r') as file:
-            lines = file.readlines()
-        assert len(lines) == 3
-        assert lines[0].rstrip() == 'APPENDED TEXT1'
-        assert lines[1].rstrip() == 'APPENDED TEXT2'
-        assert lines[2].rstrip() == 'APPENDED TEXT3'
-    finally:
-        os.remove(temp_file_path)
-
-
-def test_append_file_not_opened():
-    with pytest.raises(FileNotFoundError):
-        append_file(str('unknown file'), content='APPEND TEXT')
-
-
-def test_edit_file(tmp_path):
-    temp_file_path = tmp_path / 'a.txt'
-    content = 'Line 1\nLine 2\nLine 3\nLine 4\nLine 5'
-    temp_file_path.write_text(content)
-
-    open_file(str(temp_file_path))
-
-    with io.StringIO() as buf:
-        with contextlib.redirect_stdout(buf):
-            edit_file(
-                str(temp_file_path),
-                start=1,
-                end=3,
-                content='REPLACE TEXT',
-            )
-        result = buf.getvalue()
-        expected = (
-            f'[File: {temp_file_path} (3 lines total after edit)]\n'
-            '1|REPLACE TEXT\n'
-            '2|Line 4\n'
-            '3|Line 5\n' + MSG_FILE_UPDATED + '\n'
-        )
-        assert result.split('\n') == expected.split('\n')
-
-    with open(temp_file_path, 'r') as file:
-        lines = file.readlines()
-    assert len(lines) == 3
-    assert lines[0].rstrip() == 'REPLACE TEXT'
-    assert lines[1].rstrip() == 'Line 4'
-    assert lines[2].rstrip() == 'Line 5'
-
-
-def test_edit_file_from_scratch(tmp_path):
-    temp_file_path = tmp_path / 'a.txt'
-    create_file(str(temp_file_path))
-    open_file(str(temp_file_path))
-
-    with io.StringIO() as buf:
-        with contextlib.redirect_stdout(buf):
-            edit_file(
-                str(temp_file_path),
-                start=1,
-                end=1,
-                content='REPLACE TEXT',
-            )
-        result = buf.getvalue()
-        expected = (
-            f'[File: {temp_file_path} (1 lines total after edit)]\n'
-            '1|REPLACE TEXT\n' + MSG_FILE_UPDATED + '\n'
-        )
-        assert result.split('\n') == expected.split('\n')
-
-    with open(temp_file_path, 'r') as file:
-        lines = file.readlines()
-    assert len(lines) == 1
-    assert lines[0].rstrip() == 'REPLACE TEXT'
-
-
-def test_edit_file_from_scratch_multiline_with_backticks_and_second_edit(tmp_path):
-    temp_file_path = tmp_path / 'a.txt'
-    create_file(str(temp_file_path))
-    open_file(str(temp_file_path))
-
-    with io.StringIO() as buf:
-        with contextlib.redirect_stdout(buf):
-            edit_file(
-                str(temp_file_path),
-                1,
-                1,
-                '`REPLACE TEXT1`\n`REPLACE TEXT2`\n`REPLACE TEXT3`',
-            )
-        result = buf.getvalue()
-        expected = (
-            f'[File: {temp_file_path} (3 lines total after edit)]\n'
-            '1|`REPLACE TEXT1`\n'
-            '2|`REPLACE TEXT2`\n'
-            '3|`REPLACE TEXT3`\n' + MSG_FILE_UPDATED + '\n'
-        )
-        assert result.split('\n') == expected.split('\n')
-
-    with open(temp_file_path, 'r') as file:
-        lines = file.readlines()
-    assert len(lines) == 3
-    assert lines[0].rstrip() == '`REPLACE TEXT1`'
-    assert lines[1].rstrip() == '`REPLACE TEXT2`'
-    assert lines[2].rstrip() == '`REPLACE TEXT3`'
-
-    # Check that no backticks are escaped in the edit_file call
-    assert '\\`' not in result
-
-    # Perform a second edit
-    with io.StringIO() as buf:
-        with contextlib.redirect_stdout(buf):
-            edit_file(
-                str(temp_file_path),
-                1,
-                3,
-                '`REPLACED TEXT1`\n`REPLACED TEXT2`\n`REPLACED TEXT3`',
-            )
-        second_result = buf.getvalue()
-        second_expected = (
-            f'[File: {temp_file_path} (3 lines total after edit)]\n'
-            '1|`REPLACED TEXT1`\n'
-            '2|`REPLACED TEXT2`\n'
-            '3|`REPLACED TEXT3`\n' + MSG_FILE_UPDATED + '\n'
-        )
-        assert second_result.split('\n') == second_expected.split('\n')
-
-    with open(temp_file_path, 'r') as file:
-        lines = file.readlines()
-    assert len(lines) == 3
-    assert lines[0].rstrip() == '`REPLACED TEXT1`'
-    assert lines[1].rstrip() == '`REPLACED TEXT2`'
-    assert lines[2].rstrip() == '`REPLACED TEXT3`'
-
-    # Check that no backticks are escaped in the second edit_file call
-    assert '\\`' not in second_result
-
-
-def test_edit_file_from_scratch_multiline(tmp_path):
-    temp_file_path = tmp_path / 'a.txt'
-    create_file(str(temp_file_path))
-    open_file(temp_file_path)
-
-    with io.StringIO() as buf:
-        with contextlib.redirect_stdout(buf):
-            edit_file(
-                str(temp_file_path),
-                1,
-                1,
-                content='REPLACE TEXT1\nREPLACE TEXT2\nREPLACE TEXT3',
-            )
-        result = buf.getvalue()
-        expected = (
-            f'[File: {temp_file_path} (3 lines total after edit)]\n'
-            '1|REPLACE TEXT1\n'
-            '2|REPLACE TEXT2\n'
-            '3|REPLACE TEXT3\n' + MSG_FILE_UPDATED + '\n'
-        )
-        assert result.split('\n') == expected.split('\n')
-
-    with open(temp_file_path, 'r') as file:
-        lines = file.readlines()
-    assert len(lines) == 3
-    assert lines[0].rstrip() == 'REPLACE TEXT1'
-    assert lines[1].rstrip() == 'REPLACE TEXT2'
-    assert lines[2].rstrip() == 'REPLACE TEXT3'
-
-
-def test_edit_file_not_opened():
-    with pytest.raises(FileNotFoundError):
-        edit_file(
-            str('unknown file'),
-            1,
-            3,
-            'REPLACE TEXT',
-        )
 
 
 def test_search_dir(tmp_path):
@@ -763,8 +543,10 @@ def test_search_file_not_exist_term(tmp_path):
 
 
 def test_search_file_not_exist_file():
-    with pytest.raises(FileNotFoundError):
-        search_file('Line 6', '/unexist/path/a.txt')
+    _capture_file_operation_error(
+        lambda: search_file('Line 6', '/unexist/path/a.txt'),
+        'ERROR: File /unexist/path/a.txt not found.',
+    )
 
 
 def test_find_file(tmp_path):
@@ -798,177 +580,22 @@ def test_find_file_cwd(tmp_path, monkeypatch):
 def test_find_file_not_exist_file():
     with io.StringIO() as buf:
         with contextlib.redirect_stdout(buf):
-            find_file('unexist.txt')
+            find_file('nonexist.txt')
         result = buf.getvalue()
     assert result is not None
 
-    expected = '[No matches found for "unexist.txt" in ./]\n'
+    expected = '[No matches found for "nonexist.txt" in ./]\n'
     assert result.split('\n') == expected.split('\n')
 
 
 def test_find_file_not_exist_file_specific_path(tmp_path):
     with io.StringIO() as buf:
         with contextlib.redirect_stdout(buf):
-            find_file('unexist.txt', str(tmp_path))
+            find_file('nonexist.txt', str(tmp_path))
         result = buf.getvalue()
     assert result is not None
 
-    expected = f'[No matches found for "unexist.txt" in {tmp_path}]\n'
-    assert result.split('\n') == expected.split('\n')
-
-
-def test_edit_lint_file_pass(tmp_path, monkeypatch):
-    # Create a Python file with correct syntax
-    file_path = tmp_path / 'test_file.py'
-    file_path.write_text('\n')
-
-    # patch ENABLE_AUTO_LINT
-    monkeypatch.setattr(
-        'opendevin.runtime.plugins.agent_skills.agentskills.ENABLE_AUTO_LINT', True
-    )
-
-    # Test linting functionality
-    with io.StringIO() as buf:
-        with contextlib.redirect_stdout(buf):
-            open_file(str(file_path))
-            edit_file(str(file_path), 1, 1, "print('hello')\n")
-        result = buf.getvalue()
-
-    assert result is not None
-    expected = (
-        f'[File: {file_path} (1 lines total)]\n'
-        '1|\n'
-        f'[File: {file_path} (2 lines total after edit)]\n'
-        "1|print('hello')\n"
-        '2|\n' + MSG_FILE_UPDATED + '\n'
-    )
-    assert result.split('\n') == expected.split('\n')
-
-
-def test_lint_file_fail_undefined_name(tmp_path, monkeypatch, capsys):
-    # Create a Python file with a syntax error
-    file_path = tmp_path / 'test_file.py'
-    file_path.write_text('\n')
-
-    # Set environment variable to enable linting
-    monkeypatch.setattr(
-        'opendevin.runtime.plugins.agent_skills.agentskills.ENABLE_AUTO_LINT', True
-    )
-
-    open_file(str(file_path))
-    edit_file(str(file_path), 1, 1, 'undefined_name()\n')
-
-    result = capsys.readouterr().out
-    print(result)
-
-    assert result is not None
-    expected = (
-        f'[File: {file_path} (1 lines total)]\n'
-        '1|\n'
-        '[Your proposed edit has introduced new syntax error(s). Please understand the errors and retry your edit command.]\n'
-        'ERRORS:\n'
-        f"{file_path}:1:1: F821 undefined name 'undefined_name'\n"
-        '[This is how your edit would have looked if applied]\n'
-        '-------------------------------------------------\n'
-        '1|undefined_name()\n'
-        '2|\n'
-        '-------------------------------------------------\n\n'
-        '[This is the original code before your edit]\n'
-        '-------------------------------------------------\n'
-        '1|\n'
-        '-------------------------------------------------\n'
-        'Your changes have NOT been applied. Please fix your edit command and try again.\n'
-        'You either need to 1) Specify the correct start/end line arguments or 2) Correct your edit code.\n'
-        'DO NOT re-run the same failed edit command. Running it again will lead to the same error.\n'
-    )
-    assert result.split('\n') == expected.split('\n')
-
-
-def test_lint_file_fail_undefined_name_long(tmp_path, monkeypatch, capsys):
-    # Create a Python file with a syntax error
-    file_path = tmp_path / 'test_file.py'
-    file_path.write_text('\n' * 1000)
-
-    # Set environment variable to enable linting
-    monkeypatch.setattr(
-        'opendevin.runtime.plugins.agent_skills.agentskills.ENABLE_AUTO_LINT', True
-    )
-
-    open_file(str(file_path))
-    edit_file(str(file_path), 500, 500, 'undefined_name()\n')
-
-    result = capsys.readouterr().out
-    print(result)
-
-    assert result is not None
-
-    open_lines = '\n'.join([f'{i+1}|' for i in range(51)])
-    expected = (
-        f'[File: {file_path} (1000 lines total)]\n'
-        f'{open_lines}\n'
-        '(949 more lines below)\n'
-        '[Your proposed edit has introduced new syntax error(s). Please understand the errors and retry your edit command.]\n'
-        'ERRORS:\n'
-        f"{file_path}:500:1: F821 undefined name 'undefined_name'\n"
-        '[This is how your edit would have looked if applied]\n'
-        '-------------------------------------------------\n'
-        '(495 more lines above)\n'
-        '496|\n'
-        '497|\n'
-        '498|\n'
-        '499|\n'
-        '500|undefined_name()\n'
-        '501|\n'
-        '502|\n'
-        '503|\n'
-        '504|\n'
-        '505|\n'
-        '(496 more lines below)\n'
-        '-------------------------------------------------\n\n'
-        '[This is the original code before your edit]\n'
-        '-------------------------------------------------\n'
-        '(495 more lines above)\n'
-        '496|\n'
-        '497|\n'
-        '498|\n'
-        '499|\n'
-        '500|\n'
-        '501|\n'
-        '502|\n'
-        '503|\n'
-        '504|\n'
-        '505|\n'
-        '(495 more lines below)\n'
-        '-------------------------------------------------\n'
-        'Your changes have NOT been applied. Please fix your edit command and try again.\n'
-        'You either need to 1) Specify the correct start/end line arguments or 2) Correct your edit code.\n'
-        'DO NOT re-run the same failed edit command. Running it again will lead to the same error.\n'
-    )
-    assert result.split('\n') == expected.split('\n')
-
-
-def test_lint_file_disabled_undefined_name(tmp_path, monkeypatch, capsys):
-    # Create a Python file with a syntax error
-    file_path = tmp_path / 'test_file.py'
-    file_path.write_text('\n')
-
-    # Set environment variable to disable linting
-    monkeypatch.setattr(
-        'opendevin.runtime.plugins.agent_skills.agentskills.ENABLE_AUTO_LINT', False
-    )
-
-    open_file(str(file_path))
-    edit_file(str(file_path), 1, 1, 'undefined_name()\n')
-
-    result = capsys.readouterr().out
-    assert result is not None
-    expected = (
-        f'[File: {file_path} (1 lines total)]\n'
-        '1|\n'
-        f'[File: {file_path} (2 lines total after edit)]\n'
-        '1|undefined_name()\n'
-        '2|\n' + MSG_FILE_UPDATED + '\n'
-    )
+    expected = f'[No matches found for "nonexist.txt" in {tmp_path}]\n'
     assert result.split('\n') == expected.split('\n')
 
 
@@ -1089,3 +716,302 @@ def test_parse_pptx(tmp_path):
         'Hello, this is the second test PPTX slide.\n\n'
     )
     assert output == expected_output, f'Expected output does not match. Got: {output}'
+
+
+# =============================================================================
+
+
+def test_file_editor_view(tmp_path):
+    # generate a random directory
+    random_dir = tmp_path / 'dir_1'
+    random_dir.mkdir()
+    # create a file in the directory
+    random_file = random_dir / 'a.txt'
+    random_file.write_text('Line 1\nLine 2\nLine 3\nLine 4\nLine 5')
+    random_dir_2 = tmp_path / 'dir_2'
+    random_dir_2.mkdir()
+    random_file_2 = random_dir_2 / 'b.txt'
+    random_file_2.write_text('Line 1\nLine 2\nLine 3\nLine 4\nLine 5')
+
+    from openhands.runtime.plugins.agent_skills.agentskills import file_editor
+
+    # view the file
+    result = file_editor(command='view', path=str(random_file))
+    print('\n', result)
+    assert result is not None
+    assert (
+        result.split('\n')
+        == f"""Here's the result of running `cat -n` on {random_file}:
+     1\tLine 1
+     2\tLine 2
+     3\tLine 3
+     4\tLine 4
+     5\tLine 5
+""".split('\n')
+    )
+
+    # view the directory
+    result = file_editor(command='view', path=str(tmp_path))
+    print('\n', result)
+    assert result is not None
+    assert (
+        result.strip().split('\n')
+        == f"""Here's the files and directories up to 2 levels deep in {tmp_path}, excluding hidden items:
+{tmp_path}
+{tmp_path}/dir_2
+{tmp_path}/dir_2/b.txt
+{tmp_path}/dir_1
+{tmp_path}/dir_1/a.txt
+""".strip().split('\n')
+    )
+
+
+def test_file_editor_create(tmp_path):
+    # generate a random directory
+    random_dir = tmp_path / 'dir_1'
+    random_dir.mkdir()
+    # create a file in the directory
+    random_file = random_dir / 'a.txt'
+
+    from openhands.runtime.plugins.agent_skills.agentskills import file_editor
+
+    # view an unexist file
+    result = file_editor(command='view', path=str(random_file))
+    print(result)
+    assert result is not None
+    assert (
+        result
+        == f'ERROR:\nThe path {random_file} does not exist. Please provide a valid path.'
+    )
+
+    # create a file
+    result = file_editor(command='create', path=str(random_file), file_text='Line 6')
+    print(result)
+    assert result is not None
+    assert result == f'File created successfully at: {random_file}'
+
+    # view again
+    result = file_editor(command='view', path=str(random_file))
+    print(result)
+    assert result is not None
+    assert (
+        result.strip().split('\n')
+        == f"""Here's the result of running `cat -n` on {random_file}:
+     1\tLine 6
+""".strip().split('\n')
+    )
+
+
+@pytest.fixture
+def setup_file(tmp_path):
+    random_dir = tmp_path / 'dir_1'
+    random_dir.mkdir()
+    random_file = random_dir / 'a.txt'
+    return random_file
+
+
+def test_file_editor_create_and_view(setup_file):
+    random_file = setup_file
+
+    # Test create command
+    result = file_editor(
+        command='create', path=str(random_file), file_text='Line 1\nLine 2\nLine 3'
+    )
+    print(result)
+    assert result == f'File created successfully at: {random_file}'
+
+    # Test view command for file
+    result = file_editor(command='view', path=str(random_file))
+    print(result)
+    assert (
+        result.strip().split('\n')
+        == f"""Here's the result of running `cat -n` on {random_file}:
+     1\tLine 1
+     2\tLine 2
+     3\tLine 3
+""".strip().split('\n')
+    )
+
+    # Test view command for directory
+    result = file_editor(command='view', path=str(random_file.parent))
+    assert f'{random_file.parent}' in result
+    assert f'{random_file.name}' in result
+
+
+def test_file_editor_view_nonexistent(setup_file):
+    random_file = setup_file
+
+    # Test view command for non-existent file
+    result = file_editor(command='view', path=str(random_file))
+    assert (
+        result
+        == f'ERROR:\nThe path {random_file} does not exist. Please provide a valid path.'
+    )
+
+
+def test_file_editor_str_replace(setup_file):
+    random_file = setup_file
+    file_editor(
+        command='create', path=str(random_file), file_text='Line 1\nLine 2\nLine 3'
+    )
+
+    # Test str_replace command
+    result = file_editor(
+        command='str_replace',
+        path=str(random_file),
+        old_str='Line 2',
+        new_str='New Line 2',
+    )
+    print(result)
+    assert (
+        result
+        == f"""The file {random_file} has been edited. Here's the result of running `cat -n` on a snippet of {random_file}:
+     1\tLine 1
+     2\tNew Line 2
+     3\tLine 3
+Review the changes and make sure they are as expected. Edit the file again if necessary."""
+    )
+
+    # View the file after str_replace
+    result = file_editor(command='view', path=str(random_file))
+    print(result)
+    assert (
+        result.strip().split('\n')
+        == f"""Here's the result of running `cat -n` on {random_file}:
+     1\tLine 1
+     2\tNew Line 2
+     3\tLine 3
+""".strip().split('\n')
+    )
+
+
+def test_file_editor_str_replace_non_existent(setup_file):
+    random_file = setup_file
+    file_editor(
+        command='create', path=str(random_file), file_text='Line 1\nLine 2\nLine 3'
+    )
+
+    # Test str_replace with non-existent string
+    result = file_editor(
+        command='str_replace',
+        path=str(random_file),
+        old_str='Non-existent Line',
+        new_str='New Line',
+    )
+    print(result)
+    assert (
+        result
+        == f'ERROR:\nNo replacement was performed, old_str `Non-existent Line` did not appear verbatim in {random_file}.'
+    )
+
+
+def test_file_editor_insert(setup_file):
+    random_file = setup_file
+    file_editor(
+        command='create', path=str(random_file), file_text='Line 1\nLine 2\nLine 3'
+    )
+
+    # Test insert command
+    result = file_editor(
+        command='insert', path=str(random_file), insert_line=2, new_str='Inserted Line'
+    )
+    print(result)
+    assert (
+        result
+        == f"""The file {random_file} has been edited. Here's the result of running `cat -n` on a snippet of the edited file:
+     1\tLine 1
+     2\tLine 2
+     3\tInserted Line
+     4\tLine 3
+Review the changes and make sure they are as expected (correct indentation, no duplicate lines, etc). Edit the file again if necessary."""
+    )
+
+    # View the file after insert
+    result = file_editor(command='view', path=str(random_file))
+    assert (
+        result.strip().split('\n')
+        == f"""Here's the result of running `cat -n` on {random_file}:
+     1\tLine 1
+     2\tLine 2
+     3\tInserted Line
+     4\tLine 3
+""".strip().split('\n')
+    )
+
+
+def test_file_editor_insert_invalid_line(setup_file):
+    random_file = setup_file
+    file_editor(
+        command='create', path=str(random_file), file_text='Line 1\nLine 2\nLine 3'
+    )
+
+    # Test insert with invalid line number
+    result = file_editor(
+        command='insert',
+        path=str(random_file),
+        insert_line=10,
+        new_str='Invalid Insert',
+    )
+    assert (
+        result
+        == 'ERROR:\nInvalid `insert_line` parameter: 10. It should be within the range of lines of the file: [0, 3]'
+    )
+
+
+def test_file_editor_undo_edit(setup_file):
+    random_file = setup_file
+    result = file_editor(
+        command='create', path=str(random_file), file_text='Line 1\nLine 2\nLine 3'
+    )
+    print(result)
+    assert result == f"""File created successfully at: {random_file}"""
+
+    # Make an edit
+    result = file_editor(
+        command='str_replace',
+        path=str(random_file),
+        old_str='Line 2',
+        new_str='New Line 2',
+    )
+    print(result)
+    assert (
+        result
+        == f"""The file {random_file} has been edited. Here's the result of running `cat -n` on a snippet of {random_file}:
+     1\tLine 1
+     2\tNew Line 2
+     3\tLine 3
+Review the changes and make sure they are as expected. Edit the file again if necessary."""
+    )
+
+    # Test undo_edit command
+    result = file_editor(command='undo_edit', path=str(random_file))
+    print(result)
+    assert (
+        result
+        == f"""Last edit to {random_file} undone successfully. Here's the result of running `cat -n` on {random_file}:
+     1\tLine 1
+     2\tLine 2
+     3\tLine 3
+"""
+    )
+
+    # View the file after undo_edit
+    result = file_editor(command='view', path=str(random_file))
+    assert (
+        result.strip().split('\n')
+        == f"""Here's the result of running `cat -n` on {random_file}:
+     1\tLine 1
+     2\tLine 2
+     3\tLine 3
+""".strip().split('\n')
+    )
+
+
+def test_file_editor_undo_edit_no_edits(tmp_path):
+    random_file = tmp_path / 'a.txt'
+    random_file.touch()
+
+    # Test undo_edit when no edits have been made
+    result = file_editor(command='undo_edit', path=str(random_file))
+    print(result)
+    assert result == f'ERROR:\nNo edit history found for {random_file}.'

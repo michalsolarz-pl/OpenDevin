@@ -1,124 +1,190 @@
 import asyncio
-import json
-import logging
-import multiprocessing as mp
 import os
-import pathlib
 import re
-import shutil
-import subprocess
-import time
-from concurrent.futures import ProcessPoolExecutor
+import tempfile
+from typing import Any
 
-import docker
+import pandas as pd
 from datasets import load_dataset
-from tqdm import tqdm
 
 from evaluation.agent_bench.helper import (
+    FAKE_RESPONSES,
+    INST_SUFFIXES,
     compare_results,
     create_sh_file,
-    try_parse_answer,
 )
-from opendevin.controller.state.state import State
-from opendevin.core.config import args, config, get_llm_config_arg
-from opendevin.core.logger import get_console_handler
-from opendevin.core.logger import opendevin_logger as logger
-from opendevin.core.main import main
-from opendevin.events.action import CmdRunAction, MessageAction
-from opendevin.events.serialization.event import event_to_dict
-from opendevin.runtime.docker.ssh_box import DockerSSHBox
+from evaluation.utils.shared import (
+    EvalMetadata,
+    EvalOutput,
+    make_metadata,
+    prepare_dataset,
+    reset_logger_for_multiprocessing,
+    run_evaluation,
+)
+from openhands.controller.state.state import State
+from openhands.core.config import (
+    AppConfig,
+    SandboxConfig,
+    get_llm_config_arg,
+    parse_arguments,
+)
+from openhands.core.logger import openhands_logger as logger
+from openhands.core.main import create_runtime, run_controller
+from openhands.events.action import AgentFinishAction, CmdRunAction, MessageAction
+from openhands.events.observation import CmdOutputObservation
+from openhands.runtime.base import Runtime
+from openhands.utils.async_utils import call_async_from_sync
 
 
-def cleanup():
-    print('Cleaning up child processes...')
-    for process in mp.active_children():
-        print(f'Terminating child process: {process.name}')
-        process.terminate()
-        process.join()
-
-
-def codeact_user_response(state: State) -> str:
-    msg = (
-        'Please continue working on the task on whatever approach you think is suitable.\n'
-        'If you think you have solved the task, please first send your answer to user through '
-        'message and then <execute_bash> exit </execute_bash>.\n'
-        'Please encapsulate your final answer (answer ONLY) within <solution> and </solution>.\n'
-        'For example: The answer to the question is <solution> 42 </solution>.\n'
-        'IMPORTANT: YOU SHOULD NEVER ASK FOR HUMAN HELP.\n'
+def get_config(
+    metadata: EvalMetadata,
+) -> AppConfig:
+    config = AppConfig(
+        default_agent=metadata.agent_class,
+        run_as_openhands=False,
+        runtime='eventstream',
+        max_iterations=metadata.max_iterations,
+        sandbox=SandboxConfig(
+            base_container_image='python:3.12-bookworm',
+            enable_auto_lint=True,
+            use_host_network=False,
+        ),
+        # do not mount workspace
+        workspace_base=None,
+        workspace_mount_path=None,
     )
-    if state.history:
-        # check if the last action is an answer, if so, return exit for early exit
-        last_action, _ = state.history[-1]
-        ans = try_parse_answer(last_action)
-        if ans is not None:
-            return '/exit'
+    config.set_llm_config(metadata.llm_config)
+    return config
 
-        user_msgs = [
-            action
-            for action, _ in state.history
-            if isinstance(action, MessageAction) and action.source == 'user'
-        ]
-        if len(user_msgs) >= 2:
-            # let the agent know that it can give up when it has tried 3 times
-            return (
-                msg
-                + 'If you want to give up, run: <execute_bash> exit </execute_bash>.\n'
+
+def initialize_runtime(
+    runtime: Runtime,
+    instance: pd.Series,  # this argument is not required
+):
+    """Initialize the runtime for the agent.
+
+    This function is called before the runtime is used to run the agent.
+    """
+    logger.info(f"{'-' * 50} BEGIN Runtime Initialization Fn {'-' * 50}")
+    obs: CmdOutputObservation
+
+    # Set instance id
+    action = CmdRunAction(command='mkdir -p /workspace')
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    assert obs.exit_code == 0
+
+    action = CmdRunAction(command='cd /workspace')
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    assert obs.exit_code == 0
+
+    init_cmd = instance.init
+    if init_cmd is not None:
+        script_name = f'{instance.instance_id}_init.sh'
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            host_script_path = os.path.join(tmpdir, script_name)
+            create_sh_file(host_script_path, init_cmd)
+            runtime.copy_to(
+                host_script_path,
+                '/workspace',
             )
-    return msg
+
+        logger.info(f'Running init script: {script_name}')
+        action = CmdRunAction(command=f'chmod +x ./{script_name} && ./{script_name}')
+        logger.info(action, extra={'msg_type': 'ACTION'})
+        obs = runtime.run_action(action)
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+        assert obs.exit_code == 0
+
+    logger.info(f"{'-' * 50} END Runtime Initialization Fn {'-' * 50}")
 
 
-AGENT_CLS_TO_FAKE_USER_RESPONSE_FN = {
-    'CodeActAgent': codeact_user_response,
-}
+def complete_runtime(
+    runtime: Runtime,
+    instance: pd.Series,  # this argument is not required, but it is used to get the workspace_dir_name
+) -> dict[str, Any]:
+    """Complete the runtime for the agent.
 
-AGENT_CLS_TO_INST_SUFFIX = {
-    'CodeActAgent': 'When you think you have solved the question, '
-    'please first send your answer to user through message and then exit.\n'
-}
+    This function is called before the runtime is used to run the agent.
+    If you need to do something in the sandbox to get the correctness metric after
+    the agent has run, modify this function.
+    """
+    logger.info(f"{'-' * 50} BEGIN Runtime Completion Fn {'-' * 50}")
+    obs: CmdOutputObservation
+
+    agent_answer = None
+    get_agent_result_cmd = instance.get_agent_result
+    if get_agent_result_cmd is not None:
+        script_name = 'get_agent_result.sh'
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            host_script_path = os.path.join(tmpdir, script_name)
+            create_sh_file(host_script_path, get_agent_result_cmd)
+            runtime.copy_to(
+                host_script_path,
+                '/workspace',
+            )
+            logger.info(f'Running get agent result cmd: {script_name}')
+
+        action = CmdRunAction(
+            command=f'chmod +x ./{script_name} && ./{script_name}',
+            keep_prompt=False,
+        )
+        logger.info(action, extra={'msg_type': 'ACTION'})
+        obs = runtime.run_action(action)
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+        assert obs.exit_code == 0
+        agent_answer = obs.content
+    # IF the agent answer is not found, retrieve it from the history
+    # We wait until the controller finishes
+
+    final_ans = None
+    if instance.ground_truth is not None:
+        final_ans = instance.ground_truth
+    else:
+        get_ground_truth_cmd = instance.get_ground_truth
+        if get_ground_truth_cmd is not None:
+            script_name = 'get_ground_truth.sh'
+            with tempfile.TemporaryDirectory() as tmpdir:
+                host_script_path = os.path.join(tmpdir, script_name)
+                create_sh_file(host_script_path, get_ground_truth_cmd)
+                runtime.copy_to(
+                    host_script_path,
+                    '/workspace',
+                )
+            logger.info(f'Running get ground truth cmd: {script_name}')
+
+            action = CmdRunAction(
+                command=f'chmod +x ./{script_name} && ./{script_name}',
+                keep_prompt=False,
+            )
+            logger.info(action, extra={'msg_type': 'ACTION'})
+            obs = runtime.run_action(action)
+            logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+            final_ans = obs.content
+
+    logger.info(f"{'-' * 50} END Runtime Completion Fn {'-' * 50}")
+    return {
+        'final_ans': final_ans,
+        'agent_answer': agent_answer,
+    }
 
 
 def process_instance(
-    instance,
-    agent_class,
-    metadata,
-    eval_output_dir,
+    instance: pd.Series,
+    metadata: EvalMetadata,
     reset_logger: bool = True,
-):
-    # =============================================
-    # preparation
-    # =============================================
+) -> EvalOutput:
+    config = get_config(metadata)
 
-    inst_id = instance.instance_id
-    question = instance.description
-    # create a directory for the instance's workspace
-    instance_workspace = str(os.path.join(config.workspace_base, inst_id))
-    container_inst_workspace = str(
-        os.path.join(config.workspace_mount_path_in_sandbox, inst_id)
-    )
-    if os.path.exists(instance_workspace):
-        shutil.rmtree(instance_workspace)
-    os.makedirs(instance_workspace, exist_ok=True)
-
-    # Set up the logger properly, so you can run multiprocessing to parallel the evaluation
+    # Setup the logger properly, so you can run multi-processing to parallelize the evaluation
     if reset_logger:
-        # Set up logger
-        log_file = os.path.join(eval_output_dir, 'logs', f'instance_{inst_id}.log')
-        # Remove all existing handlers from logger
-        for handler in logger.handlers[:]:
-            logger.removeHandler(handler)
-        # add back the console handler to print ONE line
-        logger.addHandler(get_console_handler())
-        logger.info(
-            f'Starting evaluation for instance {inst_id}.\nHint: run "tail -f {log_file}" to see live logs in a separate shell'
-        )
-        # Remove all existing handlers from logger
-        for handler in logger.handlers[:]:
-            logger.removeHandler(handler)
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setFormatter(
-            logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        )
-        logger.addHandler(file_handler)
+        log_dir = os.path.join(metadata.eval_output_dir, 'infer_logs')
+        reset_logger_for_multiprocessing(logger, instance.instance_id, log_dir)
+    else:
+        logger.info(f'Starting evaluation for instance {instance.instance_id}.')
 
     # =============================================
     # build instruction
@@ -131,90 +197,70 @@ def process_instance(
         'Please encapsulate your final answer (answer ONLY) within <solution> and </solution>.\n'
         'For example: The answer to the question is <solution> 42 </solution>.\n'
         '# Problem \n'
-        f'{question}\n\n'
+        f'{instance.description}\n\n'
     )
     instruction += (
         'IMPORTANT: You should ONLY interact with the environment provided '
         'to you AND NEVER ASK FOR HUMAN HELP.\n'
     )
     # NOTE: You can actually set slightly different instruction for different agents
-    instruction += AGENT_CLS_TO_INST_SUFFIX.get(agent_class, '')
+    instruction += INST_SUFFIXES[metadata.agent_class]
 
     # =============================================
     # create sandbox and run the agent
     # =============================================
 
-    sandbox = DockerSSHBox()
-    sandbox.execute(f'cd {inst_id}')
+    runtime: Runtime = create_runtime(config)
+    call_async_from_sync(runtime.connect)
 
-    init_cmd = instance.init
-    if init_cmd is not None:
-        scpt_name = f'{instance.instance_id}_init.sh'
-        scpt_path = os.path.join(container_inst_workspace, scpt_name)
-        host_scpt_path = os.path.join(instance_workspace, scpt_name)
-        create_sh_file(host_scpt_path, init_cmd)
-        logger.info(f'Running init script: {scpt_path}')
-        _, init_res = sandbox.execute(scpt_path)
-        logger.info(f'Init script result: {init_res}')
+    initialize_runtime(runtime, instance=instance)
 
     # Here's how you can run the agent (similar to the `main` function) and get the final task state
-    state: State = asyncio.run(
-        main(
-            instruction,
-            fake_user_response_fn=AGENT_CLS_TO_FAKE_USER_RESPONSE_FN.get(agent_class),
-            sandbox=sandbox,
+    state: State | None = asyncio.run(
+        run_controller(
+            config=config,
+            initial_user_action=MessageAction(content=instruction),
+            runtime=runtime,
+            fake_user_response_fn=FAKE_RESPONSES[metadata.agent_class],
         )
     )
-
     if state is None:
         raise ValueError('State should not be None.')
-
-    # get the ground truth
-    # OSBenchSSHBox.get_ground_truth(instance, state)
 
     # =============================================
     # result evaluation
     # =============================================
 
-    agent_answer = ''
-    get_agent_result_cmd = instance.get_agent_result
-    if get_agent_result_cmd is not None:
-        scpt_name = f'{instance.instance_id}_get_agent_result.sh'
-        scpt_path = os.path.join(container_inst_workspace, scpt_name)
-        host_scpt_path = os.path.join(instance_workspace, scpt_name)
-        create_sh_file(host_scpt_path, get_agent_result_cmd)
-        logger.info(f'Running get agent result cmd: {scpt_path}')
-        _, agent_answer = sandbox.execute(scpt_path)
-    else:
+    return_val = complete_runtime(runtime, instance)
+    agent_answer = return_val['agent_answer']
+    final_ans = return_val['final_ans']
+
+    # If the agent answer is not found, retrieve it from the history
+    if agent_answer is None:
+        agent_answer = ''
         logger.info('Retrieving agent answer from history.')
         raw_ans = ''
-        for act, _ in reversed(state.history):
-            if isinstance(act, MessageAction) and act.source == 'agent':
-                raw_ans = act.content
-                break
-            if isinstance(act, CmdRunAction) and act.source == 'agent':
-                raw_ans = act.thought
-                break
-        agent_answer = re.findall(r'<solution>(.*?)</solution>', raw_ans)
+
+        # retrieve the last agent message or thought
+        for event in state.history.get_events(reverse=True):
+            if event.source == 'agent':
+                if isinstance(event, AgentFinishAction):
+                    raw_ans = event.thought
+                    break
+                elif isinstance(event, MessageAction):
+                    raw_ans = event.content
+                    break
+                elif isinstance(event, CmdRunAction):
+                    raw_ans = event.thought
+                    break
+
+        # parse the answer for a solution tag
+        agent_answer = re.findall(r'<solution>(.*?)</solution>', raw_ans, re.DOTALL)
         if len(agent_answer) == 0:
             logger.warning(f'Failed to parse model answer: {raw_ans}')
             agent_answer = raw_ans
         else:
             agent_answer = agent_answer[0]
-
-    final_ans = ''
-    if instance.ground_truth is not None:
-        final_ans = instance.ground_truth
-    else:
-        get_ground_truth_cmd = instance.get_ground_truth
-        if get_ground_truth_cmd is not None:
-            scpt_name = f'{instance.instance_id}_get_ground_truth.sh'
-            scpt_path = os.path.join(container_inst_workspace, scpt_name)
-            host_scpt_path = os.path.join(instance_workspace, scpt_name)
-            create_sh_file(host_scpt_path, get_ground_truth_cmd)
-            logger.info(f'Running get ground truth cmd: {scpt_path}')
-            sandbox.execute(f'cd {container_inst_workspace}')
-            _, final_ans = sandbox.execute(scpt_path)
 
     comparison_method = instance.comparison_method
     logger.info(
@@ -222,184 +268,55 @@ def process_instance(
     )
     test_result = compare_results(comparison_method, agent_answer, final_ans)
 
-    histories = [
-        (event_to_dict(action), event_to_dict(obs)) for action, obs in state.history
-    ]
+    # history is now available as a stream of events, rather than list of pairs of (Action, Observation)
+    # for compatibility with the existing output format, we can remake the pairs here
+    # remove when it becomes unnecessary
+    histories = state.history.compatibility_for_eval_history_pairs()
+
     metrics = state.metrics.get() if state.metrics else None
 
     # Save the output
-    output = {
-        'instance_id': inst_id,
-        'instance': instance.to_dict(),
-        'instruction': instruction,
-        'metadata': metadata,
-        'history': histories,
-        'metrics': metrics,
-        'error': state.error if state and state.error else None,
-        'test_result': {
+    output = EvalOutput(
+        instance_id=instance.instance_id,
+        instance=instance.to_dict(),
+        instruction=instruction,
+        metadata=metadata,
+        history=histories,
+        metrics=metrics,
+        error=state.last_error if state and state.last_error else None,
+        test_result={
             'agent_answer': agent_answer,
             'final_answer': final_ans,
             'check_method': comparison_method,
             'result': test_result,
         },
-    }
-
-    # clean up
-    if os.path.exists(instance_workspace):
-        shutil.rmtree(instance_workspace)
-    # Close the sandbox
-    try:
-        sandbox.close()
-    except docker.errors.NotFound as e:
-        logger.error(f'Failed to close sandbox: {e}')
+    )
     return output
 
 
 if __name__ == '__main__':
-    # =============================================
-    # load datasets
-    # =============================================
-
+    args = parse_arguments()
     dataset = load_dataset('iFurySt/AgentBench')
     agent_bench_tests = dataset['osbench'].to_pandas()
-    logger.info(f'Loaded {len(agent_bench_tests)} tests.')
 
-    # =============================================
-    # handle arguments and prepare for evaluation
-    # =============================================
-
+    llm_config = None
     if args.llm_config:
-        specified_llm_config = get_llm_config_arg(args.llm_config)
-        if specified_llm_config:
-            config.llm = specified_llm_config
-    logger.info(f'Config for evaluation: {config}')
+        llm_config = get_llm_config_arg(args.llm_config)
 
-    # TEST METADATA
-    agent_cls = args.agent_cls
-    assert (
-        agent_cls in AGENT_CLS_TO_FAKE_USER_RESPONSE_FN
-    ), f'Unsupported agent class: {agent_cls}'
-    model_name = config.llm.model.split('/')[-1]
-    max_iterations = args.max_iterations
-    eval_note = ''
-    if args.eval_note is not None:
-        eval_note += '_N_' + args.eval_note
-    eval_op_dir = str(
-        os.path.join(
-            args.eval_output_dir,
-            'agent_bench',
-            agent_cls,
-            model_name + '_maxiter_' + str(max_iterations) + eval_note,
-        )
+    if llm_config is None:
+        raise ValueError(f'Could not find LLM config: --llm_config {args.llm_config}')
+
+    metadata = make_metadata(
+        llm_config,
+        'AgentBench-OS',
+        args.agent_cls,
+        args.max_iterations,
+        args.eval_note,
+        args.eval_output_dir,
     )
+    output_file = os.path.join(metadata.eval_output_dir, 'output.jsonl')
+    instances = prepare_dataset(agent_bench_tests, output_file, args.eval_n_limit)
 
-    pathlib.Path(eval_op_dir).mkdir(parents=True, exist_ok=True)
-    pathlib.Path(str(os.path.join(eval_op_dir, 'logs'))).mkdir(
-        parents=True, exist_ok=True
+    run_evaluation(
+        instances, metadata, output_file, args.eval_num_workers, process_instance
     )
-    logger.info(f'Using evaluation output directory: {eval_op_dir}')
-
-    meta = {
-        'agent_class': agent_cls,
-        'model_name': model_name,
-        'max_iterations': max_iterations,
-        'eval_output_dir': eval_op_dir,
-        'start_time': time.strftime('%Y-%m-%d %H:%M:%S'),
-        # get the commit id of current repo for reproducibility
-        'git_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'])
-        .decode('utf-8')
-        .strip(),
-    }
-    logger.info(f'Metadata: {meta}')
-    with open(os.path.join(eval_op_dir, 'metadata.json'), 'w') as f:
-        json.dump(meta, f)
-
-    # LIMIT EVALUATION
-    eval_n_limit = args.eval_n_limit
-    if eval_n_limit:
-        agent_bench_tests = agent_bench_tests[:eval_n_limit]
-        logger.info(f'Limiting evaluation to first {eval_n_limit} instances.')
-
-    # OUTPUT FILE
-    output_file = os.path.join(eval_op_dir, 'output.jsonl')
-    logger.info(f'Writing evaluation output to {output_file}')
-    finished_instance_ids = set()
-    if os.path.exists(output_file):
-        with open(output_file, 'r') as f:
-            for line in f:
-                data = json.loads(line)
-                finished_instance_ids.add(data['instance_id'])
-        logger.warning(
-            f'Output file {output_file} already exists. Loaded {len(finished_instance_ids)} finished instances.'
-        )
-    output_fp = open(output_file, 'a')
-
-    logger.info(
-        f'Evaluation started with Agent {agent_cls}, model {model_name}, max iterations {max_iterations}.'
-    )
-
-    # =============================================
-    # filter out finished instances
-    # =============================================
-
-    new_agent_bench_tests = []
-    for idx, inst in agent_bench_tests.iterrows():
-        if inst.instance_id in finished_instance_ids:
-            logger.info(
-                f'Skipping instance {inst.instance_id} as it is already finished.'
-            )
-            continue
-        new_agent_bench_tests.append(inst)
-
-    agent_bench_tests = new_agent_bench_tests
-    logger.info(
-        f'Finished instances: {len(finished_instance_ids)}, Remaining instances: {len(agent_bench_tests)}'
-    )
-
-    # =============================================
-    # start task
-    # =============================================
-
-    pbar = tqdm(total=len(agent_bench_tests))
-
-    # This function tracks the progress AND write the output to a JSONL file
-    def update_progress(fut):
-        pbar.update(1)
-        output = fut.result()
-        pbar.set_description(f'Instance {output["instance_id"]}')
-        pbar.set_postfix_str(f'Test Result: {output["test_result"]["result"]}')
-        logger.info(
-            f'Finished evaluation for instance {output["instance_id"]}: {output["test_result"]["result"]}'
-        )
-        output_fp.write(json.dumps(output) + '\n')
-        output_fp.flush()
-
-    # This sets the multiprocessing
-    num_workers = args.eval_num_workers
-    logger.info(f'Using {num_workers} workers for evaluation.')
-
-    try:
-        with ProcessPoolExecutor(num_workers) as executor:
-            futures = []
-            # This is how we perform multiprocessing
-            for inst in agent_bench_tests:
-                future = executor.submit(
-                    process_instance,
-                    inst,
-                    agent_cls,
-                    meta,
-                    eval_op_dir,
-                    reset_logger=bool(num_workers > 1),
-                )
-                future.add_done_callback(update_progress)
-                futures.append(future)
-
-            # Wait for all futures to complete
-            for future in futures:
-                future.result()
-    except KeyboardInterrupt:
-        print('KeyboardInterrupt received. Cleaning up...')
-        cleanup()
-
-    output_fp.close()
-    logger.info('Evaluation finished.')

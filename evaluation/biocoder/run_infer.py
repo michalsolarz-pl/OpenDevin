@@ -1,178 +1,259 @@
 import asyncio
+import functools
 import json
-import logging
-import multiprocessing as mp
 import os
-import pathlib
-import subprocess
-import time
-from concurrent.futures import ProcessPoolExecutor
+import tempfile
+from typing import Any
 
 import pandas as pd
 from datasets import load_dataset
-from tqdm import tqdm
 
-import agenthub
-from evaluation.biocoder.biocoder_env_box import BiocoderData, BiocoderSSHBox
-from opendevin.controller.state.state import State
-from opendevin.core.config import args, config, get_llm_config_arg
-from opendevin.core.logger import get_console_handler
-from opendevin.core.logger import opendevin_logger as logger
-from opendevin.core.main import main
-from opendevin.events.action import MessageAction
-from opendevin.events.serialization.event import event_to_dict
-
-
-def cleanup():
-    print('Cleaning up child processes...')
-    for process in mp.active_children():
-        print(f'Terminating child process: {process.name}')
-        process.terminate()
-        process.join()
-
-
-def codeact_user_response(state: State) -> str:
-    msg = (
-        'Please continue working on the task on whatever approach you think is suitable.\n'
-        'If you think you have modified the code in a way that fixes the issue, please run the following command: <execute_bash> exit </execute_bash>.\n'
-        'IMPORTANT: YOU SHOULD NEVER ASK FOR HUMAN HELP OR USE THE INTERNET TO SOLVE THIS TASK.\n'
-    )
-    if state.history:
-        user_msgs = [
-            action
-            for action, _ in state.history
-            if isinstance(action, MessageAction) and action.source == 'user'
-        ]
-        if len(user_msgs) >= 2:
-            # let the agent know that it can give up when it has tried 3 times
-            return (
-                msg
-                + 'If you want to give up, run: <execute_bash> exit </execute_bash>.\n'
-            )
-    return msg
-
-
-def monologue_user_response(state: State) -> str:
-    raise NotImplementedError('MonologueAgent should never ask for user responses.')
-
+from evaluation.biocoder.utils import BiocoderData
+from evaluation.utils.shared import (
+    EvalMetadata,
+    EvalOutput,
+    codeact_user_response,
+    make_metadata,
+    prepare_dataset,
+    reset_logger_for_multiprocessing,
+    run_evaluation,
+)
+from openhands.controller.state.state import State
+from openhands.core.config import (
+    AppConfig,
+    SandboxConfig,
+    get_llm_config_arg,
+    parse_arguments,
+)
+from openhands.core.logger import openhands_logger as logger
+from openhands.core.main import create_runtime, run_controller
+from openhands.events.action import CmdRunAction, MessageAction
+from openhands.events.observation import CmdOutputObservation
+from openhands.runtime.base import Runtime
+from openhands.utils.async_utils import call_async_from_sync
 
 AGENT_CLS_TO_FAKE_USER_RESPONSE_FN = {
-    'CodeActAgent': codeact_user_response,
-    'MonologueAgent': monologue_user_response,
+    'CodeActAgent': functools.partial(
+        codeact_user_response, encapsulate_solution=True, try_parse=None
+    ),
 }
 
 AGENT_CLS_TO_INST_SUFFIX = {
     'CodeActAgent': 'When you think you have fixed the issue through code changes, please run the following command: <execute_bash> exit </execute_bash>.\n'
 }
 
+FILE_EXT_MAP = {
+    'python': 'py',
+    'java': 'java',
+    'c': 'c',
+    'cpp': 'cpp',
+    'javascript': 'js',
+    'typescript': 'ts',
+}
 
-def get_test_result(instance, sandbox, workspace_dir_name):
+
+def get_config(
+    metadata: EvalMetadata,
+) -> AppConfig:
+    BIOCODER_BENCH_CONTAINER_IMAGE = 'public.ecr.aws/i5g0m1f6/eval_biocoder:v1.0'
+
+    config = AppConfig(
+        default_agent=metadata.agent_class,
+        run_as_openhands=False,
+        runtime='eventstream',
+        max_iterations=metadata.max_iterations,
+        sandbox=SandboxConfig(
+            base_container_image=BIOCODER_BENCH_CONTAINER_IMAGE,
+            enable_auto_lint=True,
+            use_host_network=False,
+        ),
+        # do not mount workspace
+        workspace_base=None,
+        workspace_mount_path=None,
+    )
+    config.set_llm_config(metadata.llm_config)
+    return config
+
+
+def initialize_runtime(
+    runtime: Runtime,
+    instance: BiocoderData,  # this argument is not required
+):
+    """Initialize the runtime for the agent.
+
+    This function is called before the runtime is used to run the agent.
+    """
+    logger.info(f"{'-' * 50} BEGIN Runtime Initialization Fn {'-' * 50}")
+    obs: CmdOutputObservation
+
+    file_ext = FILE_EXT_MAP[instance.language.lower()]
+
+    action = CmdRunAction(command='mkdir -p /workspace && mkdir -p /testing_files')
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    assert obs.exit_code == 0
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        context_path = os.path.join(tmpdir, 'context.' + file_ext)
+        with open(context_path, 'w') as f:
+            f.write(instance.contextCode)
+        runtime.copy_to(context_path, '/testing_files')
+
+        golden_path = os.path.join(tmpdir, 'golden.' + file_ext)
+        with open(golden_path, 'w') as f:
+            f.write(instance.goldenCode)
+        runtime.copy_to(golden_path, '/testing_files')
+
+        testcase_json = {
+            'test_case_id': instance.test_case_id,
+            'num_cases': 1000,
+            'language': instance.language.lower(),
+        }
+        testcase_path = os.path.join(tmpdir, 'testcase_biocoder.json')
+        with open(testcase_path, 'w') as f:
+            f.write(json.dumps(testcase_json, indent=4))
+
+        runtime.copy_to(testcase_path, '/testing_files')
+
+    # setup paths
+    remove_code_script = os.path.join(
+        os.path.dirname(__file__), 'scripts', 'setup', 'remove_code.py'
+    )
+    runtime.copy_to(remove_code_script, '/testing_files')
+
+    action = CmdRunAction(command='cd /workspace')
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    assert obs.exit_code == 0
+
+    # download repository archive
+    repository_url = f"https://biocoder.lilbillbiscuit.com/repos/{instance.repository.split('/')[1]}.zip"
+    action = CmdRunAction(command='wget -O repo.zip ' + repository_url)
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    assert obs.exit_code == 0, f'Failed to download the repository: {obs.content}'
+
+    # unzip the repository
+    action = CmdRunAction(command='unzip -o -q repo.zip && rm repo.zip')
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    assert obs.exit_code == 0, f'Failed to unzip the repository: {obs.content}'
+
+    # chmod 777
+    action = CmdRunAction(command='chmod -R 777 /workspace')
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    assert obs.exit_code == 0, f'Failed to chmod the files: {obs.content}'
+
+    # remove code for evaluation instance
+    target_filepath = os.path.join(
+        '/workspace', instance.repository.split('/')[1], instance.filePath
+    )
+    line_start = instance.lineStart
+    line_end = instance.lineEnd
+    language = instance.language.lower()
+    action = CmdRunAction(
+        command=f'python3 /testing_files/remove_code.py --target_filepath {target_filepath} --line_start {line_start} --line_end {line_end} --language {language}'
+    )
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    assert obs.exit_code == 0, f'Failed to remove the code: {obs.content}'
+
+    logger.info(f"{'-' * 50} END Runtime Initialization Fn {'-' * 50}")
+
+
+def complete_runtime(
+    runtime: Runtime,
+    instance: pd.Series,  # this argument is not required, but it is used to get the workspace_dir_name
+) -> dict[str, Any]:
+    """Complete the runtime for the agent.
+
+    This function is called before the runtime is used to run the agent.
+    If you need to do something in the sandbox to get the correctness metric after
+    the agent has run, modify this function.
+    """
+    logger.info(f"{'-' * 50} BEGIN Runtime Completion Fn {'-' * 50}")
+    obs: CmdOutputObservation
+
     test_result = {'result': {}, 'metadata': {}}
-    try:
-        code = sandbox.get_changed_code(include_signature=True)
-        sandbox.copy_changed_code()
+
+    copy_changed_code_script = os.path.join(
+        os.path.dirname(__file__), 'scripts', 'setup', 'copy_changed_code.py'
+    )
+    runtime.copy_to(copy_changed_code_script, '/testing_files')
+
+    file_ext = FILE_EXT_MAP[instance.language.lower()]
+    target_filepath = os.path.join(
+        '/workspace', instance.repository.split('/')[1], instance.filePath
+    )
+    generated_path = os.path.join('/testing_files', 'generated.' + file_ext)
+
+    action = CmdRunAction(
+        command=f'python3 /testing_files/copy_changed_code.py --target_filepath {target_filepath} --generated_code_filepath {generated_path} --line_start {instance.lineStart} --include_signature'
+    )
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    if obs.exit_code == 0:
         test_result['metadata']['1_copy_change_success'] = True
+
+        action = CmdRunAction(command=f'cat {generated_path}', keep_prompt=False)
+        logger.info(action, extra={'msg_type': 'ACTION'})
+        obs = runtime.run_action(action)
+        assert obs.exit_code == 0
+
+        code = obs.content
         test_result['metadata']['1_copy_change_code'] = code
-    except Exception:
-        logger.error('Error fetching changed code for this instance')
+    else:
         test_result['metadata']['1_copy_change_success'] = False
         test_result['metadata']['1_copy_change_code'] = None
 
-    exit_code, output = sandbox.execute_and_check(
-        'cd /testing',
-        'Failed to cd /testing',
-    )
-    logger.info(f'cd $REPO_PATH: {output}')
+    action = CmdRunAction(command='cd /testing_files')
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    assert obs.exit_code == 0
 
-    exit_code, output = sandbox.execute_and_check(
-        'whoami',
-        'Failed to run whoami',
+    action = CmdRunAction(
+        command='/home/openhands/mambaforge/bin/mamba run -n test python3 /testing/start_test_openhands.py'
     )
-    logger.info(f'whoami: {output}')
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+    assert obs.exit_code == 0
 
-    exit_code, output = sandbox.execute(
-        '/home/devin/mambaforge/bin/mamba run -n test python3 /testing/start_test_opendevin.py'
+    action = CmdRunAction(
+        command='cat /testing_files/results_biocoder.json', keep_prompt=False
     )
-    logger.info(f'$TEST_CMD:\n{output}')
-
-    exit_code, output = sandbox.execute_and_check(
-        'cat /testing_files/results_biocoder.json', 'Failed to read the result file'
-    )
-    if exit_code == 0:
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    if obs.exit_code == 0:
         test_result['metadata']['2_run_test_success'] = True
-        test_result['metadata']['2_run_test_result'] = str(output)
+        test_result['metadata']['2_run_test_result'] = str(obs.content)
+        json_obj = json.loads(obs.content)
+        test_result['result'] = json_obj['result']
     else:
         test_result['metadata']['2_run_test_success'] = False
-        test_result['metadata']['2_run_test_result'] = str(output)
-    json_obj = json.loads(output)
-    test_result['result'] = json_obj['result']
+        test_result['metadata']['2_run_test_result'] = str(obs.content)
 
+    logger.info(f"{'-' * 50} END Runtime Completion Fn {'-' * 50}")
     return test_result
 
 
 def process_instance(
-    instance,
-    agent_class,
-    metadata,
-    skip_workspace_mount,
-    eval_output_dir,
+    instance: pd.Series,
+    metadata: EvalMetadata,
     reset_logger: bool = True,
-):
+) -> EvalOutput:
+    config = get_config(metadata)
     instance = BiocoderData(**instance)
     print(instance)
-    workspace_dir_name = (
-        f'{instance.repository}__{instance.test_case_id[:10]}__{os.getpid()}'.replace(
-            '/', '__'
-        )
-    )
-    workspace_mount_path = os.path.join(config.workspace_base, workspace_dir_name)
-    # create process-specific workspace dir
-    # if `not skip_workspace_mount` - we will create a workspace directory for EACH process
-    # so that different agent don't interfere with each other.
-    if not skip_workspace_mount:
-        workspace_mount_path = os.path.join(workspace_mount_path, str(os.getpid()))
-        pathlib.Path(workspace_mount_path).mkdir(parents=True, exist_ok=True)
+    instance_id = f'{instance.repository}__{instance.instance_id[:10]}'
 
-    # Setup the logger properly, so you can run multi-processing to parallize the evaluation
+    # Setup the logger properly, so you can run multi-processing to parallelize the evaluation
     if reset_logger:
-        # Set up logger
-        log_file = os.path.join(
-            eval_output_dir, 'logs', f'instance_{instance.test_case_id}.log'
-        )
-        # Remove all existing handlers from logger
-        for handler in logger.handlers[:]:
-            logger.removeHandler(handler)
-        # add back the console handler to print ONE line
-        logger.addHandler(get_console_handler())
-        logger.info(
-            f'Starting evaluation for instance {instance.test_case_id}.\nHint: run "tail -f {log_file}" to see live logs in a seperate shell'
-        )
-        # Remove all existing handlers from logger
-        for handler in logger.handlers[:]:
-            logger.removeHandler(handler)
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setFormatter(
-            logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        )
-        logger.addHandler(file_handler)
-
-    if not skip_workspace_mount:
-        logger.info(f'Process-specific workspace mounted at {workspace_mount_path}')
-
-    # NOTE: this is something special we do for SWE-Bench due to the reason described in the previous section
-    # You can omit this if you don't need to setup specialized sandbox
-    workspace_dir_name = f'{instance.repository}__{instance.test_case_id[:10]}'.replace(
-        '/', '__'
-    )
-    sandbox = BiocoderSSHBox.get_box_for_instance(
-        instance,
-        workspace_dir_name,
-        skip_workspace_mount=False,
-        workspace_mount_path=workspace_mount_path,
-        sandbox_plugins=agenthub.Agent.get_cls(agent_class).sandbox_plugins,
-    )
-
-    sandbox.remove_code()
+        log_dir = os.path.join(metadata.eval_output_dir, 'infer_logs')
+        reset_logger_for_multiprocessing(logger, instance_id, log_dir)
+    else:
+        logger.info(f'Starting evaluation for instance {instance_id}.')
 
     # Prepare instruction
     instruction = (
@@ -191,203 +272,76 @@ def process_instance(
         'You do not need to run the code to check if it works. \n'
         'Make sure to include proper formatting in Java and Python, including correct braces and/or indentation.\n'
     )
-
-    # instruction = (
-    #     f'In the file {instance.filePath}, there is a function with a signature and without a body. Your job is to complete the function, according to the given instructions. When you complete the function, respond with the function body, and nothing else.'
-    #     'The repository has cloned for you to start working. You are not allowed to run any bash commands, just modify the files. \n\n'
-    #     '# Problem Statement\n'
-    #     'Complete the following function signature:\n\n'
-    #     f'{instance.signature}'
-    #     'The function should do the following:\n\n'
-    #     f'{instance.promptSummaryOnly}\n\n'
-    # )
-    #
-    # instruction += (
-    #     'IMPORTANT: You should ONLY interact with the environment provided to you AND NEVER ASK FOR HUMAN HELP.\n'
-    #     'You should NOT modify any other files other than the file intended. This means that you should NOT write any test cases.\n'
-    #     'Do NOT add any import statements or change anything else other than the writing the function body.\n'
-    #     'You do not need to run the code to check if it works. The system will automatically check the correctness of your code.\n'
-    #     'Make sure to include proper formatting in Java and Python, including correct braces and/or indentation.\n'
-    # )
-
     # NOTE: You can actually set slightly different instruction for different agents
-    instruction += AGENT_CLS_TO_INST_SUFFIX.get(agent_class, '')
+    instruction += AGENT_CLS_TO_INST_SUFFIX[metadata.agent_class]
+
+    runtime = create_runtime(config)
+    call_async_from_sync(runtime.connect)
+    initialize_runtime(runtime, instance)
 
     # Here's how you can run the agent (similar to the `main` function) and get the final task state
-    state: State = asyncio.run(
-        main(
-            instruction,
-            fake_user_response_fn=AGENT_CLS_TO_FAKE_USER_RESPONSE_FN.get(agent_class),
-            sandbox=sandbox,
+    state: State | None = asyncio.run(
+        run_controller(
+            config=config,
+            initial_user_action=MessageAction(content=instruction),
+            runtime=runtime,
+            fake_user_response_fn=AGENT_CLS_TO_FAKE_USER_RESPONSE_FN[
+                metadata.agent_class
+            ],
         )
     )
 
-    test_result = get_test_result(instance, sandbox, workspace_dir_name)
-
     if state is None:
         raise ValueError('State should not be None.')
+
+    test_result = complete_runtime(runtime, instance)
     metrics = state.metrics.get() if state.metrics else None
+    # history is now available as a stream of events, rather than list of pairs of (Action, Observation)
+    # for compatibility with the existing output format, we can remake the pairs here
+    # remove when it becomes unnecessary
+    histories = state.history.compatibility_for_eval_history_pairs()
+
+    test_result['generated'] = test_result['metadata']['1_copy_change_code']
 
     # Save the output
-    output = {
-        'test_case_id': instance.test_case_id,
-        'biocoder_instance': instance.to_dict(),
-        'instruction': instruction,
-        'generated': test_result['metadata']['1_copy_change_code'],
-        'metadata': metadata,
-        'history': [
-            (event_to_dict(action), event_to_dict(obs)) for action, obs in state.history
-        ],
-        'metrics': metrics,
-        'error': state.error if state and state.error else None,
-        'test_result': test_result,
-    }
-
-    # Close the sandbox
-    sandbox.close()
+    output = EvalOutput(
+        instance_id=instance.instance_id,
+        instance=instance.to_dict(),
+        instruction=instruction,
+        metadata=metadata,
+        history=histories,
+        metrics=metrics,
+        error=state.last_error if state and state.last_error else None,
+        test_result=test_result,
+    )
     return output
 
 
 if __name__ == '__main__':
-    # NOTE: It is preferable to load datasets from huggingface datasets and perform post-processing
-    # so we don't need to manage file uploading to OpenDevin's repo
+    args = parse_arguments()
+
     dataset = load_dataset('lilbillbiscuit/biocoder_public')
-    biocoder_tests = dataset['test'].to_pandas()
+    biocoder_tests = dataset['train'].to_pandas()
+    biocoder_tests['instance_id'] = biocoder_tests['test_case_id']
 
-    # Check https://github.com/OpenDevin/OpenDevin/blob/main/evaluation/swe_bench/README.md#configure-opendevin-and-your-llm
-    # for details of how to set `llm_config`
+    llm_config = None
     if args.llm_config:
-        specified_llm_config = get_llm_config_arg(args.llm_config)
-        if specified_llm_config:
-            config.llm = specified_llm_config
-    logger.info(f'Config for evaluation: {config}')
+        llm_config = get_llm_config_arg(args.llm_config)
 
-    # TEST METADATA
-    agent_class = args.agent_cls
-    assert (
-        agent_class in AGENT_CLS_TO_FAKE_USER_RESPONSE_FN
-    ), f'Unsupported agent class: {agent_class}'
-    model_name = config.llm.model.split('/')[-1]
-    max_iterations = args.max_iterations
-    eval_note = ''
-    if args.eval_note is not None:
-        eval_note += '_N_' + args.eval_note
-    eval_output_dir = os.path.join(
-        args.eval_output_dir,
+    if llm_config is None:
+        raise ValueError(f'Could not find LLM config: --llm_config {args.llm_config}')
+
+    metadata = make_metadata(
+        llm_config,
         'biocoder',
-        agent_class,
-        model_name + '_maxiter_' + str(max_iterations) + eval_note,
+        args.agent_cls,
+        args.max_iterations,
+        args.eval_note,
+        args.eval_output_dir,
     )
+    output_file = os.path.join(metadata.eval_output_dir, 'output.jsonl')
+    instances = prepare_dataset(biocoder_tests, output_file, args.eval_n_limit)
 
-    eval_output_dir = str(eval_output_dir)
-
-    pathlib.Path(eval_output_dir).mkdir(parents=True, exist_ok=True)
-    pathlib.Path(os.path.join(eval_output_dir, 'logs')).mkdir(
-        parents=True, exist_ok=True
+    run_evaluation(
+        instances, metadata, output_file, args.eval_num_workers, process_instance
     )
-    logger.info(f'Using evaluation output directory: {eval_output_dir}')
-
-    metadata = {
-        'agent_class': agent_class,
-        'model_name': model_name,
-        'max_iterations': max_iterations,
-        'eval_output_dir': eval_output_dir,
-        'start_time': time.strftime('%Y-%m-%d %H:%M:%S'),
-        # get the commit id of current repo for reproduciblity
-        'git_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'])
-        .decode('utf-8')
-        .strip(),
-    }
-    logger.info(f'Metadata: {metadata}')
-    with open(os.path.join(eval_output_dir, 'metadata.json'), 'w') as f:
-        json.dump(metadata, f)
-
-    # LIMIT EVALUATION
-    eval_n_limit = args.eval_n_limit
-    if eval_n_limit:
-        biocoder_tests = biocoder_tests.head(eval_n_limit)
-        logger.info(f'Limiting evaluation to first {eval_n_limit} instances.')
-
-    # OUTPUT FILE
-    output_file = os.path.join(eval_output_dir, 'output.jsonl')
-    logger.info(f'Writing evaluation output to {output_file}')
-    finished_test_case_ids = set()
-    if os.path.exists(output_file):
-        with open(output_file, 'r') as f:
-            for line in f:
-                data = json.loads(line)
-                finished_test_case_ids.add(data['test_case_id'])
-        logger.warning(
-            f'Output file {output_file} already exists. Loaded {len(finished_test_case_ids)} finished instances.'
-        )
-    output_fp = open(output_file, 'a')
-
-    logger.info(
-        f'Evaluation started with Agent {agent_class}, model {model_name}, max iterations {max_iterations}.'
-    )
-
-    # =============================================
-    # filter out finished instances
-    new_biocoder_tests = []
-    for idx, instance in biocoder_tests.iterrows():
-        if instance.test_case_id in finished_test_case_ids:
-            logger.info(
-                f'Skipping instance {instance.test_case_id} as it is already finished.'
-            )
-            continue
-        new_biocoder_tests.append(instance)
-
-    biocoder_tests = pd.DataFrame(new_biocoder_tests)
-    logger.info(
-        f'Finished instances: {len(finished_test_case_ids)}, Remaining instances: {len(biocoder_tests)}'
-    )
-    # =============================================
-
-    pbar = tqdm(total=len(biocoder_tests))
-
-    # This function tracks the progress AND write the output to a JSONL file
-    def update_progress(future):
-        pbar.update(1)
-        output = future.result()
-        pbar.set_description(f'Instance {output["test_case_id"]}')
-        pbar.set_postfix_str(f'Test Result: {output["test_result"]}')
-        logger.info(
-            f'Finished evaluation for instance {output["test_case_id"]}: {output["test_result"]}'
-        )
-        output_fp.write(json.dumps(output) + '\n')
-        output_fp.flush()
-
-    # This sets the multi-processing
-    num_workers = args.eval_num_workers
-    logger.info(f'Using {num_workers} workers for evaluation.')
-
-    # This is SWE-Bench specific - CodeActAgent doesn't require mounted workspace to work
-    skip_workspace_mount = agent_class == 'CodeActAgent'
-    logger.info(f'Skipping workspace mount: {skip_workspace_mount}')
-
-    try:
-        with ProcessPoolExecutor(num_workers) as executor:
-            futures = []
-            # This is how we perform multi-processing
-            for row_idx, instance in biocoder_tests.iterrows():
-                future = executor.submit(
-                    process_instance,
-                    instance,
-                    agent_class,
-                    metadata,
-                    skip_workspace_mount,
-                    eval_output_dir,
-                    reset_logger=bool(num_workers > 1),
-                )
-                future.add_done_callback(update_progress)
-                futures.append(future)
-
-            # Wait for all futures to complete
-            for future in futures:
-                future.result()
-    except KeyboardInterrupt:
-        print('KeyboardInterrupt received. Cleaning up...')
-        cleanup()
-
-    output_fp.close()
-    logger.info('Evaluation finished.')

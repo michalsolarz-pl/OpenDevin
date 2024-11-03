@@ -1,34 +1,40 @@
 import { Tooltip } from "@nextui-org/react";
-import React, { useEffect } from "react";
+import React from "react";
 import { useSelector } from "react-redux";
-import ArrowIcon from "#/assets/arrow";
 import PauseIcon from "#/assets/pause";
 import PlayIcon from "#/assets/play";
-import { changeAgentState } from "#/services/agentStateService";
-import store, { RootState } from "#/store";
+import { generateAgentStateChangeEvent } from "#/services/agentStateService";
+import { RootState } from "#/store";
 import AgentState from "#/types/AgentState";
-import { clearMessages } from "#/state/chatSlice";
+import { useSocket } from "#/context/socket";
 
-const IgnoreTaskStateMap: { [k: string]: AgentState[] } = {
+const IgnoreTaskStateMap: Record<string, AgentState[]> = {
   [AgentState.PAUSED]: [
     AgentState.INIT,
     AgentState.PAUSED,
     AgentState.STOPPED,
     AgentState.FINISHED,
+    AgentState.REJECTED,
     AgentState.AWAITING_USER_INPUT,
+    AgentState.AWAITING_USER_CONFIRMATION,
   ],
   [AgentState.RUNNING]: [
     AgentState.INIT,
     AgentState.RUNNING,
     AgentState.STOPPED,
     AgentState.FINISHED,
+    AgentState.REJECTED,
     AgentState.AWAITING_USER_INPUT,
+    AgentState.AWAITING_USER_CONFIRMATION,
   ],
   [AgentState.STOPPED]: [AgentState.INIT, AgentState.STOPPED],
+  [AgentState.USER_CONFIRMED]: [AgentState.RUNNING],
+  [AgentState.USER_REJECTED]: [AgentState.RUNNING],
+  [AgentState.AWAITING_USER_CONFIRMATION]: [],
 };
 
-interface ButtonProps {
-  isDisabled: boolean;
+interface ActionButtonProps {
+  isDisabled?: boolean;
   content: string;
   action: AgentState;
   handleAction: (action: AgentState) => void;
@@ -42,90 +48,60 @@ function ActionButton({
   handleAction,
   children,
   large = false,
-}: React.PropsWithChildren<ButtonProps>): React.ReactNode {
+}: React.PropsWithChildren<ActionButtonProps>) {
   return (
     <Tooltip content={content} closeDelay={100}>
       <button
         onClick={() => handleAction(action)}
         disabled={isDisabled}
-        className={`${large ? "rounded-full bg-neutral-800 p-3" : ""} hover:opacity-80 transition-all`}
+        className={`
+          relative overflow-visible cursor-default hover:cursor-pointer group
+          disabled:cursor-not-allowed
+          ${large ? "rounded-full bg-neutral-800 p-3" : ""}
+          transition-all duration-300 ease-in-out
+        `}
         type="button"
       >
-        {children}
+        <span className="relative z-10 group-hover:filter group-hover:drop-shadow-[0_0_5px_rgba(255,64,0,0.4)]">
+          {children}
+        </span>
+        <span className="absolute -inset-[5px] border-2 border-red-400/40 rounded-full opacity-0 group-hover:opacity-100 transition-opacity duration-300 ease-in-out" />
       </button>
     </Tooltip>
   );
 }
 
 function AgentControlBar() {
+  const { send } = useSocket();
   const { curAgentState } = useSelector((state: RootState) => state.agent);
-  const [desiredState, setDesiredState] = React.useState(AgentState.INIT);
-  const [isLoading, setIsLoading] = React.useState(false);
 
   const handleAction = (action: AgentState) => {
-    if (IgnoreTaskStateMap[action].includes(curAgentState)) {
-      return;
+    if (!IgnoreTaskStateMap[action].includes(curAgentState)) {
+      send(generateAgentStateChangeEvent(action));
     }
-
-    if (action === AgentState.STOPPED) {
-      store.dispatch(clearMessages());
-    } else {
-      setIsLoading(true);
-    }
-
-    setDesiredState(action);
-    changeAgentState(action);
   };
 
-  useEffect(() => {
-    if (curAgentState === desiredState) {
-      if (curAgentState === AgentState.STOPPED) {
-        store.dispatch(clearMessages());
-      }
-      setIsLoading(false);
-    } else if (curAgentState === AgentState.RUNNING) {
-      setDesiredState(AgentState.RUNNING);
-    }
-    // We only want to run this effect when curAgentState changes
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [curAgentState]);
-
   return (
-    <div className="flex items-center gap-3">
-      {curAgentState === AgentState.PAUSED ? (
-        <ActionButton
-          isDisabled={
-            isLoading ||
-            IgnoreTaskStateMap[AgentState.RUNNING].includes(curAgentState)
-          }
-          content="Resume the agent task"
-          action={AgentState.RUNNING}
-          handleAction={handleAction}
-          large
-        >
-          <PlayIcon />
-        </ActionButton>
-      ) : (
-        <ActionButton
-          isDisabled={
-            isLoading ||
-            IgnoreTaskStateMap[AgentState.PAUSED].includes(curAgentState)
-          }
-          content="Pause the current task"
-          action={AgentState.PAUSED}
-          handleAction={handleAction}
-          large
-        >
-          <PauseIcon />
-        </ActionButton>
-      )}
+    <div className="flex justify-between items-center gap-20">
       <ActionButton
-        isDisabled={isLoading}
-        content="Start a new task"
-        action={AgentState.STOPPED}
+        isDisabled={
+          curAgentState !== AgentState.RUNNING &&
+          curAgentState !== AgentState.PAUSED
+        }
+        content={
+          curAgentState === AgentState.PAUSED
+            ? "Resume the agent task"
+            : "Pause the current task"
+        }
+        action={
+          curAgentState === AgentState.PAUSED
+            ? AgentState.RUNNING
+            : AgentState.PAUSED
+        }
         handleAction={handleAction}
+        large
       >
-        <ArrowIcon />
+        {curAgentState === AgentState.PAUSED ? <PlayIcon /> : <PauseIcon />}
       </ActionButton>
     </div>
   );
