@@ -2,14 +2,14 @@ import { createSlice, PayloadAction } from "@reduxjs/toolkit";
 
 type SliceState = {
   files: string[]; // base64 encoded images
-  initialQuery: string | null;
+  initialPrompt: string | null;
   selectedRepository: string | null;
   importedProjectZip: string | null; // base64 encoded zip
 };
 
 const initialState: SliceState = {
   files: [],
-  initialQuery: null,
+  initialPrompt: null,
   selectedRepository: null,
   importedProjectZip: null,
 };
@@ -27,8 +27,11 @@ export const selectedFilesSlice = createSlice({
     clearFiles(state) {
       state.files = [];
     },
-    setInitialQuery(state, action: PayloadAction<string>) {
-      state.initialQuery = action.payload;
+    setInitialPrompt(state, action: PayloadAction<string>) {
+      state.initialPrompt = action.payload;
+    },
+    clearInitialPrompt(state) {
+      state.initialPrompt = null;
     },
     setSelectedRepository(state, action: PayloadAction<string | null>) {
       state.selectedRepository = action.payload;
@@ -46,7 +49,8 @@ export const {
   addFile,
   removeFile,
   clearFiles,
-  setInitialQuery,
+  setInitialPrompt,
+  clearInitialPrompt,
   setSelectedRepository,
   clearSelectedRepository,
   setImportedProjectZip,

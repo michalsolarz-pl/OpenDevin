@@ -1,8 +1,9 @@
-import copy
 import os
 import re
 import tempfile
 from abc import ABC, abstractmethod
+
+from openhands_aci.utils.diff import get_diff
 
 from openhands.core.config import AppConfig
 from openhands.core.logger import openhands_logger as logger
@@ -10,10 +11,11 @@ from openhands.events.action import (
     FileEditAction,
     FileReadAction,
     FileWriteAction,
+    IPythonRunCellAction,
 )
+from openhands.events.event import FileEditSource
 from openhands.events.observation import (
     ErrorObservation,
-    FatalErrorObservation,
     FileEditObservation,
     FileReadObservation,
     FileWriteObservation,
@@ -23,7 +25,6 @@ from openhands.linter import DefaultLinter
 from openhands.llm.llm import LLM
 from openhands.llm.metrics import Metrics
 from openhands.utils.chunk_localizer import Chunk, get_top_k_chunk_matches
-from openhands.utils.diff import get_diff
 
 SYS_MSG = """Your job is to produce a new version of the file based on the old version and the
 provided draft of the new version. The provided draft may be incomplete (it may skip lines) and/or incorrectly indented. You should try to apply the changes present in the draft to the old version, and output a new version of the file.
@@ -92,32 +93,35 @@ class FileEditRuntimeInterface(ABC):
     def write(self, action: FileWriteAction) -> Observation:
         pass
 
+    @abstractmethod
+    def run_ipython(self, action: IPythonRunCellAction) -> Observation:
+        pass
+
 
 class FileEditRuntimeMixin(FileEditRuntimeInterface):
     # Most LLMs have output token limit of 4k tokens.
     # This restricts the number of lines we can edit to avoid exceeding the token limit.
     MAX_LINES_TO_EDIT = 300
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, enable_llm_editor: bool, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.enable_llm_editor = enable_llm_editor
 
-        llm_config = self.config.get_llm_config()
+        if not self.enable_llm_editor:
+            return
 
-        if llm_config.draft_editor is None:
-            llm_config.draft_editor = copy.deepcopy(llm_config)
+        draft_editor_config = self.config.get_llm_config('draft_editor')
 
         # manually set the model name for the draft editor LLM to distinguish token costs
-        llm_metrics = Metrics(
-            model_name='draft_editor:' + llm_config.draft_editor.model
-        )
-        if llm_config.draft_editor.caching_prompt:
+        llm_metrics = Metrics(model_name='draft_editor:' + draft_editor_config.model)
+        if draft_editor_config.caching_prompt:
             logger.debug(
                 'It is not recommended to cache draft editor LLM prompts as it may incur high costs for the same prompt. '
                 'Automatically setting caching_prompt=false.'
             )
-            llm_config.draft_editor.caching_prompt = False
+            draft_editor_config.caching_prompt = False
 
-        self.draft_editor_llm = LLM(llm_config.draft_editor, metrics=llm_metrics)
+        self.draft_editor_llm = LLM(draft_editor_config, metrics=llm_metrics)
         logger.debug(
             f'[Draft edit functionality] enabled with LLM: {self.draft_editor_llm}'
         )
@@ -154,11 +158,14 @@ class FileEditRuntimeMixin(FileEditRuntimeInterface):
     ) -> ErrorObservation | None:
         linter = DefaultLinter()
         # Copy the original file to a temporary file (with the same ext) and lint it
-        with tempfile.NamedTemporaryFile(
-            suffix=suffix, mode='w+', encoding='utf-8'
-        ) as original_file_copy, tempfile.NamedTemporaryFile(
-            suffix=suffix, mode='w+', encoding='utf-8'
-        ) as updated_file_copy:
+        with (
+            tempfile.NamedTemporaryFile(
+                suffix=suffix, mode='w+', encoding='utf-8'
+            ) as original_file_copy,
+            tempfile.NamedTemporaryFile(
+                suffix=suffix, mode='w+', encoding='utf-8'
+            ) as updated_file_copy,
+        ):
             # Lint the original file
             original_file_copy.write(old_content)
             original_file_copy.flush()
@@ -199,6 +206,15 @@ class FileEditRuntimeMixin(FileEditRuntimeInterface):
         return None
 
     def edit(self, action: FileEditAction) -> Observation:
+        if action.impl_source == FileEditSource.OH_ACI:
+            # Translate to ipython command to file_editor
+            return self.run_ipython(
+                IPythonRunCellAction(
+                    code=action.translated_ipython_code,
+                    include_extra=False,
+                )
+            )
+
         obs = self.read(FileReadAction(path=action.path))
         if (
             isinstance(obs, ErrorObservation)
@@ -214,8 +230,8 @@ class FileEditRuntimeMixin(FileEditRuntimeInterface):
             if isinstance(obs, ErrorObservation):
                 return obs
             if not isinstance(obs, FileWriteObservation):
-                return FatalErrorObservation(
-                    f'Fatal Runtime in editing: Expected FileWriteObservation, got {type(obs)}: {str(obs)}'
+                raise ValueError(
+                    f'Expected FileWriteObservation, got {type(obs)}: {str(obs)}'
                 )
             return FileEditObservation(
                 content=get_diff('', action.content, action.path),
@@ -225,8 +241,8 @@ class FileEditRuntimeMixin(FileEditRuntimeInterface):
                 new_content=action.content,
             )
         if not isinstance(obs, FileReadObservation):
-            return FatalErrorObservation(
-                f'Fatal Runtime in editing: Expected FileReadObservation, got {type(obs)}: {str(obs)}'
+            raise ValueError(
+                f'Expected FileReadObservation, got {type(obs)}: {str(obs)}'
             )
 
         original_file_content = obs.content

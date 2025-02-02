@@ -7,11 +7,16 @@ NOTE: this will be executed inside the docker sandbox.
 
 import argparse
 import asyncio
+import base64
 import io
+import json
+import mimetypes
 import os
+import re
 import shutil
 import tempfile
 import time
+import traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
 from zipfile import ZipFile
@@ -20,6 +25,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
+from openhands_aci.utils.diff import get_diff
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from uvicorn import run
@@ -34,10 +40,11 @@ from openhands.events.action import (
     FileWriteAction,
     IPythonRunCellAction,
 )
+from openhands.events.event import FileEditSource, FileReadSource
 from openhands.events.observation import (
     CmdOutputObservation,
     ErrorObservation,
-    FatalErrorObservation,
+    FileEditObservation,
     FileReadObservation,
     FileWriteObservation,
     IPythonRunCellObservation,
@@ -46,15 +53,12 @@ from openhands.events.observation import (
 from openhands.events.serialization import event_from_dict, event_to_dict
 from openhands.runtime.browser import browse
 from openhands.runtime.browser.browser_env import BrowserEnv
-from openhands.runtime.plugins import (
-    ALL_PLUGINS,
-    JupyterPlugin,
-    Plugin,
-)
+from openhands.runtime.plugins import ALL_PLUGINS, JupyterPlugin, Plugin, VSCodePlugin
 from openhands.runtime.utils.bash import BashSession
 from openhands.runtime.utils.files import insert_lines, read_lines
 from openhands.runtime.utils.runtime_init import init_user_and_working_directory
-from openhands.utils.async_utils import wait_all
+from openhands.runtime.utils.system_stats import get_system_stats
+from openhands.utils.async_utils import call_sync_from_async, wait_all
 
 
 class ActionRequest(BaseModel):
@@ -90,32 +94,41 @@ class ActionExecutor:
         browsergym_eval_env: str | None,
     ) -> None:
         self.plugins_to_load = plugins_to_load
-        self._initial_pwd = work_dir
+        self._initial_cwd = work_dir
         self.username = username
         self.user_id = user_id
         _updated_user_id = init_user_and_working_directory(
-            username=username, user_id=self.user_id, initial_pwd=work_dir
+            username=username, user_id=self.user_id, initial_cwd=work_dir
         )
         if _updated_user_id is not None:
             self.user_id = _updated_user_id
 
-        self.bash_session = BashSession(
-            work_dir=work_dir,
-            username=username,
-        )
-
+        self.bash_session: BashSession | None = None
         self.lock = asyncio.Lock()
         self.plugins: dict[str, Plugin] = {}
         self.browser = BrowserEnv(browsergym_eval_env)
         self.start_time = time.time()
         self.last_execution_time = self.start_time
+        self._initialized = False
 
     @property
-    def initial_pwd(self):
-        return self._initial_pwd
+    def initial_cwd(self):
+        return self._initial_cwd
 
     async def ainit(self):
-        await wait_all(self._init_plugin(plugin) for plugin in self.plugins_to_load)
+        # bash needs to be initialized first
+        self.bash_session = BashSession(
+            work_dir=self._initial_cwd,
+            username=self.username,
+            no_change_timeout_seconds=int(
+                os.environ.get('NO_CHANGE_TIMEOUT_SECONDS', 30)
+            ),
+        )
+        self.bash_session.initialize()
+        await wait_all(
+            (self._init_plugin(plugin) for plugin in self.plugins_to_load),
+            timeout=30,
+        )
 
         # This is a temporary workaround
         # TODO: refactor AgentSkills to be part of JupyterPlugin
@@ -130,8 +143,14 @@ class ActionExecutor:
 
         await self._init_bash_commands()
         logger.debug('Runtime client initialized.')
+        self._initialized = True
+
+    @property
+    def initialized(self) -> bool:
+        return self._initialized
 
     async def _init_plugin(self, plugin: Plugin):
+        assert self.bash_session is not None
         await plugin.initialize(self.username)
         self.plugins[plugin.name] = plugin
         logger.debug(f'Initializing plugin: {plugin.name}')
@@ -139,7 +158,7 @@ class ActionExecutor:
         if isinstance(plugin, JupyterPlugin):
             await self.run_ipython(
                 IPythonRunCellAction(
-                    code=f'import os; os.chdir("{self.bash_session.pwd}")'
+                    code=f'import os; os.chdir("{self.bash_session.cwd}")'
                 )
             )
 
@@ -147,7 +166,7 @@ class ActionExecutor:
         logger.debug(f'Initializing by running {len(INIT_COMMANDS)} bash commands...')
         for command in INIT_COMMANDS:
             action = CmdRunAction(command=command)
-            action.timeout = 300
+            action.set_hard_timeout(300)
             logger.debug(f'Executing init command: {command}')
             obs = await self.run(action)
             assert isinstance(obs, CmdOutputObservation)
@@ -168,36 +187,99 @@ class ActionExecutor:
 
     async def run(
         self, action: CmdRunAction
-    ) -> CmdOutputObservation | FatalErrorObservation:
-        return self.bash_session.run(action)
+    ) -> CmdOutputObservation | ErrorObservation:
+        assert self.bash_session is not None
+        obs = await call_sync_from_async(self.bash_session.execute, action)
+        return obs
 
     async def run_ipython(self, action: IPythonRunCellAction) -> Observation:
+        assert self.bash_session is not None
         if 'jupyter' in self.plugins:
             _jupyter_plugin: JupyterPlugin = self.plugins['jupyter']  # type: ignore
             # This is used to make AgentSkills in Jupyter aware of the
             # current working directory in Bash
-            jupyter_pwd = getattr(self, '_jupyter_pwd', None)
-            if self.bash_session.pwd != jupyter_pwd:
+            jupyter_cwd = getattr(self, '_jupyter_cwd', None)
+            if self.bash_session.cwd != jupyter_cwd:
                 logger.debug(
-                    f'{self.bash_session.pwd} != {jupyter_pwd} -> reset Jupyter PWD'
+                    f'{self.bash_session.cwd} != {jupyter_cwd} -> reset Jupyter PWD'
                 )
-                reset_jupyter_pwd_code = (
-                    f'import os; os.chdir("{self.bash_session.pwd}")'
+                reset_jupyter_cwd_code = (
+                    f'import os; os.chdir("{self.bash_session.cwd}")'
                 )
-                _aux_action = IPythonRunCellAction(code=reset_jupyter_pwd_code)
+                _aux_action = IPythonRunCellAction(code=reset_jupyter_cwd_code)
                 _reset_obs: IPythonRunCellObservation = await _jupyter_plugin.run(
                     _aux_action
                 )
                 logger.debug(
-                    f'Changed working directory in IPython to: {self.bash_session.pwd}. Output: {_reset_obs}'
+                    f'Changed working directory in IPython to: {self.bash_session.cwd}. Output: {_reset_obs}'
                 )
-                self._jupyter_pwd = self.bash_session.pwd
+                self._jupyter_cwd = self.bash_session.cwd
 
             obs: IPythonRunCellObservation = await _jupyter_plugin.run(action)
             obs.content = obs.content.rstrip()
+            matches = re.findall(
+                r'<oh_aci_output_[0-9a-f]{32}>(.*?)</oh_aci_output_[0-9a-f]{32}>',
+                obs.content,
+                re.DOTALL,
+            )
+            if matches:
+                results: list[str] = []
+                if len(matches) == 1:
+                    # Use specific actions/observations types
+                    match = matches[0]
+                    try:
+                        result_dict = json.loads(match)
+                        if result_dict.get('path'):  # Successful output
+                            if (
+                                result_dict['new_content'] is not None
+                            ):  # File edit commands
+                                diff = get_diff(
+                                    old_contents=result_dict['old_content']
+                                    or '',  # old_content is None when file is created
+                                    new_contents=result_dict['new_content'],
+                                    filepath=result_dict['path'],
+                                )
+                                return FileEditObservation(
+                                    content=diff,
+                                    path=result_dict['path'],
+                                    old_content=result_dict['old_content'],
+                                    new_content=result_dict['new_content'],
+                                    prev_exist=result_dict['prev_exist'],
+                                    impl_source=FileEditSource.OH_ACI,
+                                    formatted_output_and_error=result_dict[
+                                        'formatted_output_and_error'
+                                    ],
+                                )
+                            else:  # File view commands
+                                return FileReadObservation(
+                                    content=result_dict['formatted_output_and_error'],
+                                    path=result_dict['path'],
+                                    impl_source=FileReadSource.OH_ACI,
+                                )
+                        else:  # Error output
+                            results.append(result_dict['formatted_output_and_error'])
+                    except json.JSONDecodeError:
+                        # Handle JSON decoding errors if necessary
+                        results.append(
+                            f"Invalid JSON in 'openhands-aci' output: {match}"
+                        )
+                else:
+                    for match in matches:
+                        try:
+                            result_dict = json.loads(match)
+                            results.append(result_dict['formatted_output_and_error'])
+                        except json.JSONDecodeError:
+                            # Handle JSON decoding errors if necessary
+                            results.append(
+                                f"Invalid JSON in 'openhands-aci' output: {match}"
+                            )
+
+                # Combine the results (e.g., join them) or handle them as required
+                obs.content = '\n'.join(str(result) for result in results)
+
             if action.include_extra:
                 obs.content += (
-                    f'\n[Jupyter current working directory: {self.bash_session.pwd}]'
+                    f'\n[Jupyter current working directory: {self.bash_session.cwd}]'
                 )
                 obs.content += f'\n[Jupyter Python interpreter: {_jupyter_plugin.python_interpreter_path}]'
             return obs
@@ -213,11 +295,47 @@ class ActionExecutor:
         return str(filepath)
 
     async def read(self, action: FileReadAction) -> Observation:
+        assert self.bash_session is not None
+        if action.impl_source == FileReadSource.OH_ACI:
+            return await self.run_ipython(
+                IPythonRunCellAction(
+                    code=action.translated_ipython_code,
+                    include_extra=False,
+                )
+            )
+
         # NOTE: the client code is running inside the sandbox,
         # so there's no need to check permission
-        working_dir = self.bash_session.workdir
+        working_dir = self.bash_session.cwd
         filepath = self._resolve_path(action.path, working_dir)
         try:
+            if filepath.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
+                with open(filepath, 'rb') as file:
+                    image_data = file.read()
+                    encoded_image = base64.b64encode(image_data).decode('utf-8')
+                    mime_type, _ = mimetypes.guess_type(filepath)
+                    if mime_type is None:
+                        mime_type = 'image/png'  # default to PNG if mime type cannot be determined
+                    encoded_image = f'data:{mime_type};base64,{encoded_image}'
+
+                return FileReadObservation(path=filepath, content=encoded_image)
+            elif filepath.lower().endswith('.pdf'):
+                with open(filepath, 'rb') as file:
+                    pdf_data = file.read()
+                    encoded_pdf = base64.b64encode(pdf_data).decode('utf-8')
+                    encoded_pdf = f'data:application/pdf;base64,{encoded_pdf}'
+                return FileReadObservation(path=filepath, content=encoded_pdf)
+            elif filepath.lower().endswith(('.mp4', '.webm', '.ogg')):
+                with open(filepath, 'rb') as file:
+                    video_data = file.read()
+                    encoded_video = base64.b64encode(video_data).decode('utf-8')
+                    mime_type, _ = mimetypes.guess_type(filepath)
+                    if mime_type is None:
+                        mime_type = 'video/mp4'  # default to MP4 if MIME type cannot be determined
+                    encoded_video = f'data:{mime_type};base64,{encoded_video}'
+
+                return FileReadObservation(path=filepath, content=encoded_video)
+
             with open(filepath, 'r', encoding='utf-8') as file:
                 lines = read_lines(file.readlines(), action.start, action.end)
         except FileNotFoundError:
@@ -235,7 +353,8 @@ class ActionExecutor:
         return FileReadObservation(path=filepath, content=code_view)
 
     async def write(self, action: FileWriteAction) -> Observation:
-        working_dir = self.bash_session.workdir
+        assert self.bash_session is not None
+        working_dir = self.bash_session.cwd
         filepath = self._resolve_path(action.path, working_dir)
 
         insert = action.content.split('\n')
@@ -296,7 +415,8 @@ class ActionExecutor:
         return await browse(action, self.browser)
 
     def close(self):
-        self.bash_session.close()
+        if self.bash_session is not None:
+            self.bash_session.close()
         self.browser.close()
 
 
@@ -351,17 +471,13 @@ if __name__ == '__main__':
         logger.exception('Unhandled exception occurred:')
         return JSONResponse(
             status_code=500,
-            content={
-                'message': 'An unexpected error occurred. Please try again later.'
-            },
+            content={'detail': 'An unexpected error occurred. Please try again later.'},
         )
 
     @app.exception_handler(StarletteHTTPException)
     async def http_exception_handler(request: Request, exc: StarletteHTTPException):
         logger.error(f'HTTP exception occurred: {exc.detail}')
-        return JSONResponse(
-            status_code=exc.status_code, content={'message': exc.detail}
-        )
+        return JSONResponse(status_code=exc.status_code, content={'detail': exc.detail})
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(
@@ -370,7 +486,7 @@ if __name__ == '__main__':
         logger.error(f'Validation error occurred: {exc}')
         return JSONResponse(
             status_code=422,
-            content={'message': 'Invalid request parameters', 'details': exc.errors()},
+            content={'detail': 'Invalid request parameters', 'errors': exc.errors()},
         )
 
     @app.middleware('http')
@@ -389,7 +505,14 @@ if __name__ == '__main__':
         current_time = time.time()
         uptime = current_time - client.start_time
         idle_time = current_time - client.last_execution_time
-        return {'uptime': uptime, 'idle_time': idle_time}
+
+        response = {
+            'uptime': uptime,
+            'idle_time': idle_time,
+            'resources': get_system_stats(),
+        }
+        logger.info('Server info endpoint response: %s', response)
+        return response
 
     @app.post('/execute_action')
     async def execute_action(action_request: ActionRequest):
@@ -402,10 +525,11 @@ if __name__ == '__main__':
             observation = await client.run_action(action)
             return event_to_dict(observation)
         except Exception as e:
-            logger.error(
-                f'Error processing command: {str(e)}', exc_info=True, stack_info=True
+            logger.error(f'Error while running /execute_action: {str(e)}')
+            raise HTTPException(
+                status_code=500,
+                detail=traceback.format_exc(),
             )
-            raise HTTPException(status_code=500, detail=str(e))
 
     @app.post('/upload_file')
     async def upload_file(
@@ -497,7 +621,22 @@ if __name__ == '__main__':
 
     @app.get('/alive')
     async def alive():
+        if client is None or not client.initialized:
+            return {'status': 'not initialized'}
         return {'status': 'ok'}
+
+    # ================================
+    # VSCode-specific operations
+    # ================================
+
+    @app.get('/vscode/connection_token')
+    async def get_vscode_connection_token():
+        assert client is not None
+        if 'vscode' in client.plugins:
+            plugin: VSCodePlugin = client.plugins['vscode']  # type: ignore
+            return {'token': plugin.vscode_connection_token}
+        else:
+            return {'token': None}
 
     # ================================
     # File-specific operations for UI
@@ -533,11 +672,11 @@ if __name__ == '__main__':
 
         # Get the full path of the requested directory
         if path is None:
-            full_path = client.initial_pwd
+            full_path = client.initial_cwd
         elif os.path.isabs(path):
             full_path = path
         else:
-            full_path = os.path.join(client.initial_pwd, path)
+            full_path = os.path.join(client.initial_cwd, path)
 
         if not os.path.exists(full_path):
             # if user just removed a folder, prevent server error 500 in UI
@@ -578,7 +717,7 @@ if __name__ == '__main__':
             return sorted_entries
 
         except Exception as e:
-            logger.error(f'Error listing files: {e}', exc_info=True)
+            logger.error(f'Error listing files: {e}')
             return []
 
     logger.debug(f'Starting action execution API on port {args.port}')

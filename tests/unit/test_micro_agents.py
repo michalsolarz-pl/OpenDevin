@@ -10,10 +10,8 @@ from openhands.agenthub.micro.registry import all_microagents
 from openhands.controller.agent import Agent
 from openhands.controller.state.state import State
 from openhands.core.config import AgentConfig
-from openhands.events import EventSource
 from openhands.events.action import MessageAction
 from openhands.events.stream import EventStream
-from openhands.memory.history import ShortTermHistory
 from openhands.storage import get_file_store
 
 
@@ -28,15 +26,12 @@ def event_stream(temp_dir):
     event_stream = EventStream('asdf', file_store)
     yield event_stream
 
-    # clear after each test
-    event_stream.clear()
-
 
 @pytest.fixture
 def agent_configs():
     return {
         'CoderAgent': AgentConfig(memory_enabled=True),
-        'PlannerAgent': AgentConfig(memory_enabled=True),
+        'BrowsingAgent': AgentConfig(memory_enabled=True),
     }
 
 
@@ -74,10 +69,10 @@ def test_coder_agent_with_summary(event_stream: EventStream, agent_configs: dict
     )
     assert coder_agent is not None
 
+    # give it some history
     task = 'This is a dummy task'
-    history = ShortTermHistory()
-    history.set_event_stream(event_stream)
-    event_stream.add_event(MessageAction(content=task), EventSource.USER)
+    history = list()
+    history.append(MessageAction(content=task))
 
     summary = 'This is a dummy summary about this repo'
     state = State(history=history, inputs={'summary': summary})
@@ -119,10 +114,10 @@ def test_coder_agent_without_summary(event_stream: EventStream, agent_configs: d
     )
     assert coder_agent is not None
 
+    # give it some history
     task = 'This is a dummy task'
-    history = ShortTermHistory()
-    history.set_event_stream(event_stream)
-    event_stream.add_event(MessageAction(content=task), EventSource.USER)
+    history = list()
+    history.append(MessageAction(content=task))
 
     # set state without codebase summary
     state = State(history=history)

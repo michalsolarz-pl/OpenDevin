@@ -3,9 +3,12 @@ import logging
 import multiprocessing as mp
 import os
 import pathlib
+import signal
 import subprocess
 import time
 import traceback
+from contextlib import contextmanager
+from inspect import signature
 from typing import Any, Awaitable, Callable, TextIO
 
 import pandas as pd
@@ -14,10 +17,27 @@ from tqdm import tqdm
 
 from openhands.controller.state.state import State
 from openhands.core.config import LLMConfig
+from openhands.core.config.condenser_config import (
+    CondenserConfig,
+    NoOpCondenserConfig,
+)
+from openhands.core.exceptions import (
+    AgentRuntimeBuildError,
+    AgentRuntimeDisconnectedError,
+    AgentRuntimeError,
+    AgentRuntimeNotFoundError,
+    AgentRuntimeNotReadyError,
+    AgentRuntimeTimeoutError,
+    AgentRuntimeUnavailableError,
+)
 from openhands.core.logger import get_console_handler
 from openhands.core.logger import openhands_logger as logger
 from openhands.events.action import Action
 from openhands.events.action.message import MessageAction
+from openhands.events.event import Event
+from openhands.events.serialization.event import event_to_dict
+from openhands.events.utils import get_pairs_from_events
+from openhands.memory.condenser import get_condensation_metadata
 
 
 class EvalMetadata(BaseModel):
@@ -30,20 +50,7 @@ class EvalMetadata(BaseModel):
     dataset: str | None = None
     data_split: str | None = None
     details: dict[str, Any] | None = None
-
-    def model_dump(self, *args, **kwargs):
-        dumped_dict = super().model_dump(*args, **kwargs)
-        # avoid leaking sensitive information
-        dumped_dict['llm_config'] = self.llm_config.to_safe_dict()
-        return dumped_dict
-
-    def model_dump_json(self, *args, **kwargs):
-        dumped = super().model_dump_json(*args, **kwargs)
-        dumped_dict = json.loads(dumped)
-        # avoid leaking sensitive information
-        dumped_dict['llm_config'] = self.llm_config.to_safe_dict()
-        logger.debug(f'Dumped metadata: {dumped_dict}')
-        return json.dumps(dumped_dict)
+    condenser_config: CondenserConfig | None = None
 
 
 class EvalOutput(BaseModel):
@@ -67,26 +74,30 @@ class EvalOutput(BaseModel):
     # Optionally save the input test instance
     instance: dict[str, Any] | None = None
 
-    def model_dump(self, *args, **kwargs):
-        dumped_dict = super().model_dump(*args, **kwargs)
-        # Remove None values
-        dumped_dict = {k: v for k, v in dumped_dict.items() if v is not None}
-        # Apply custom serialization for metadata (to avoid leaking sensitive information)
-        if self.metadata is not None:
-            dumped_dict['metadata'] = self.metadata.model_dump()
-        return dumped_dict
-
-    def model_dump_json(self, *args, **kwargs):
-        dumped = super().model_dump_json(*args, **kwargs)
-        dumped_dict = json.loads(dumped)
-        # Apply custom serialization for metadata (to avoid leaking sensitive information)
-        if 'metadata' in dumped_dict:
-            dumped_dict['metadata'] = json.loads(self.metadata.model_dump_json())
-        return json.dumps(dumped_dict)
-
 
 class EvalException(Exception):
     pass
+
+
+class EvalTimeoutException(Exception):
+    pass
+
+
+@contextmanager
+def timeout(seconds: int):
+    def timeout_handler(signum, frame):
+        raise EvalTimeoutException(f'Function timed out after {seconds} seconds')
+
+    # Set up the signal handler
+    original_handler = signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(seconds)
+
+    try:
+        yield
+    finally:
+        # Restore the original handler and disable the alarm
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, original_handler)
 
 
 def codeact_user_response(
@@ -112,7 +123,14 @@ def codeact_user_response(
     if state.history:
         # check if the last action has an answer, if so, early exit
         if try_parse is not None:
-            last_action = state.history.get_last_action()
+            last_action = next(
+                (
+                    event
+                    for event in reversed(state.history)
+                    if isinstance(event, Action)
+                ),
+                None,
+            )
             ans = try_parse(last_action)
             if ans is not None:
                 return '/exit'
@@ -120,14 +138,14 @@ def codeact_user_response(
         # check if the agent has tried to talk to the user 3 times, if so, let the agent know it can give up
         user_msgs = [
             event
-            for event in state.history.get_events()
+            for event in state.history
             if isinstance(event, MessageAction) and event.source == 'user'
         ]
         if len(user_msgs) >= 2:
             # let the agent know that it can give up when it has tried 3 times
             return (
                 msg
-                + 'If you want to give up, run: <execute_bash> exit </execute_bash>.\n'
+                + 'If you want to give up, use the "finish" tool to finish the interaction.\n'
             )
     return msg
 
@@ -149,6 +167,7 @@ def make_metadata(
     eval_output_dir: str,
     data_split: str | None = None,
     details: dict[str, Any] | None = None,
+    condenser_config: CondenserConfig | None = None,
 ) -> EvalMetadata:
     model_name = llm_config.model.split('/')[-1]
     model_path = model_name.replace(':', '_').replace('@', '-')
@@ -179,6 +198,9 @@ def make_metadata(
         dataset=dataset_name,
         data_split=data_split,
         details=details,
+        condenser_config=condenser_config
+        if condenser_config
+        else NoOpCondenserConfig(),
     )
     metadata_json = metadata.model_dump_json()
     logger.info(f'Metadata: {metadata_json}')
@@ -251,7 +273,7 @@ def update_progress(
     logger.info(
         f'Finished evaluation for instance {result.instance_id}: {str(result.test_result)[:300]}...\n'
     )
-    output_fp.write(json.dumps(result.model_dump()) + '\n')
+    output_fp.write(result.model_dump_json() + '\n')
     output_fp.flush()
 
 
@@ -270,20 +292,44 @@ def _process_instance_wrapper(
     metadata: EvalMetadata,
     use_mp: bool,
     max_retries: int = 5,
+    timeout_seconds: int | None = None,
 ) -> EvalOutput:
-    """Wrap the process_instance_func to handle retries and errors.
-
-    Retry an instance up to max_retries times if it fails (e.g., due to transient network/runtime issues).
-    """
+    """Wrap the process_instance_func to handle retries and errors."""
+    runtime_failure_count = 0
     for attempt in range(max_retries + 1):
         try:
-            result = process_instance_func(instance, metadata, use_mp)
+            kwargs = {}
+            # check if process_instance_func accepts timeout_seconds parameter
+            sig = signature(process_instance_func)
+            if 'runtime_failure_count' in sig.parameters:
+                kwargs['runtime_failure_count'] = runtime_failure_count
+
+            if timeout_seconds is not None:
+                with timeout(timeout_seconds):
+                    result = process_instance_func(instance, metadata, use_mp, **kwargs)
+            else:
+                result = process_instance_func(instance, metadata, use_mp, **kwargs)
             return result
+        except EvalTimeoutException as e:
+            error = f'Timeout after {timeout_seconds} seconds'
+            stacktrace = traceback.format_exc()
+            msg = (
+                '-' * 10
+                + '\n'
+                + f'Timeout ({timeout_seconds} seconds) in instance [{instance.instance_id}], Stopped evaluation for this instance.'
+                + '\n'
+                + '-' * 10
+            )
+            logger.exception(e)
+            return EvalOutput(
+                instance_id=instance.instance_id,
+                test_result={},
+                error=error,
+            )
         except Exception as e:
             error = str(e)
             stacktrace = traceback.format_exc()
             if attempt == max_retries:
-                logger.exception(e)
                 msg = (
                     '-' * 10
                     + '\n'
@@ -307,9 +353,15 @@ def _process_instance_wrapper(
                 + '-' * 10
                 + '\n'
             )
+            # e is likely an EvalException, so we can't directly infer it from type
+            # but rather check if it's a fatal error
+            # But it can also be AgentRuntime**Error (e.g., swe_bench/eval_infer.py)
+            _error_str = type(e).__name__ + ': ' + str(e)
+            if is_fatal_runtime_error(_error_str):
+                runtime_failure_count += 1
+                msg += f'Runtime disconnected error detected for instance {instance.instance_id}, runtime failure count: {runtime_failure_count}'
+                msg += '\n' + '-' * 10 + '\n'
             logger.error(msg)
-            if use_mp:
-                print(msg)  # use print to directly print to console
             time.sleep(5)
 
 
@@ -327,6 +379,7 @@ def run_evaluation(
         [pd.Series, EvalMetadata, bool], Awaitable[EvalOutput]
     ],
     max_retries: int = 5,  # number of retries for each instance
+    timeout_seconds: int | None = None,
 ):
     use_multiprocessing = num_workers > 1
 
@@ -336,6 +389,7 @@ def run_evaluation(
             f'model {metadata.llm_config.model}, max iterations {metadata.max_iterations}.\n'
         )
     else:
+        logger.warning('Running evaluation without metadata.')
         logger.info(f'Evaluation started with {num_workers} workers.')
 
     total_instances = len(dataset)
@@ -346,7 +400,14 @@ def run_evaluation(
         if use_multiprocessing:
             with mp.Pool(num_workers) as pool:
                 args_iter = (
-                    (process_instance_func, instance, metadata, True, max_retries)
+                    (
+                        process_instance_func,
+                        instance,
+                        metadata,
+                        True,
+                        max_retries,
+                        timeout_seconds,
+                    )
                     for _, instance in dataset.iterrows()
                 )
                 results = pool.imap_unordered(_process_instance_wrapper_mp, args_iter)
@@ -411,3 +472,82 @@ def reset_logger_for_multiprocessing(
     )
     file_handler.setLevel(logging.INFO)
     logger.addHandler(file_handler)
+
+
+def update_llm_config_for_completions_logging(
+    llm_config: LLMConfig,
+    eval_output_dir: str,
+    instance_id: str,
+) -> LLMConfig:
+    """Update the LLM config for logging completions."""
+    if llm_config.log_completions:
+        llm_config.log_completions_folder = os.path.join(
+            eval_output_dir, 'llm_completions', instance_id
+        )
+        logger.info(
+            f'Logging LLM completions for instance {instance_id} to '
+            f'{llm_config.log_completions_folder}'
+        )
+    return llm_config
+
+
+# history is now available as a filtered stream of events, rather than list of pairs of (Action, Observation)
+# we rebuild the pairs here
+# for compatibility with the existing output format in evaluations
+# remove this when it's no longer necessary
+def compatibility_for_eval_history_pairs(
+    history: list[Event],
+) -> list[tuple[dict, dict]]:
+    history_pairs = []
+
+    for action, observation in get_pairs_from_events(history):
+        history_pairs.append((event_to_dict(action), event_to_dict(observation)))
+
+    return history_pairs
+
+
+def is_fatal_evaluation_error(error: str | None) -> bool:
+    if not error:
+        return False
+
+    FATAL_EXCEPTIONS = [
+        AgentRuntimeError,
+        AgentRuntimeBuildError,
+        AgentRuntimeTimeoutError,
+        AgentRuntimeUnavailableError,
+        AgentRuntimeNotReadyError,
+        AgentRuntimeDisconnectedError,
+        AgentRuntimeNotFoundError,
+        ConnectionError,
+    ]
+
+    if any(exception.__name__ in error for exception in FATAL_EXCEPTIONS):
+        logger.error(f'Fatal evaluation error detected: {error}')
+        return True
+
+    return False
+
+
+def is_fatal_runtime_error(error: str | None) -> bool:
+    if not error:
+        return False
+
+    FATAL_RUNTIME_ERRORS = [
+        AgentRuntimeTimeoutError,
+        AgentRuntimeUnavailableError,
+        AgentRuntimeDisconnectedError,
+        AgentRuntimeNotFoundError,
+    ]
+
+    if any(exception.__name__ in error for exception in FATAL_RUNTIME_ERRORS):
+        logger.error(f'Fatal runtime error detected: {error}')
+        return True
+
+    return False
+
+
+def get_metrics(state: State) -> dict[str, Any]:
+    """Extract metrics from the state."""
+    metrics = state.metrics.get() if state.metrics else {}
+    metrics['condenser'] = get_condensation_metadata(state)
+    return metrics

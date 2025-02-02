@@ -5,13 +5,33 @@
  * For more information, see https://remix.run/file-conventions/entry.client
  */
 
-import { RemixBrowser } from "@remix-run/react";
-import { startTransition, StrictMode } from "react";
+import { HydratedRouter } from "react-router/dom";
+import React, { startTransition, StrictMode } from "react";
 import { hydrateRoot } from "react-dom/client";
 import { Provider } from "react-redux";
-import { SocketProvider } from "./context/socket";
+import posthog from "posthog-js";
 import "./i18n";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import store from "./store";
+import { useConfig } from "./hooks/query/use-config";
+import { AuthProvider } from "./context/auth-context";
+import { queryClientConfig } from "./query-client-config";
+import { SettingsProvider } from "./context/settings-context";
+
+function PosthogInit() {
+  const { data: config } = useConfig();
+
+  React.useEffect(() => {
+    if (config?.POSTHOG_CLIENT_KEY) {
+      posthog.init(config.POSTHOG_CLIENT_KEY, {
+        api_host: "https://us.i.posthog.com",
+        person_profiles: "identified_only",
+      });
+    }
+  }, [config]);
+
+  return null;
+}
 
 async function prepareApp() {
   if (
@@ -26,16 +46,23 @@ async function prepareApp() {
   }
 }
 
+const queryClient = new QueryClient(queryClientConfig);
+
 prepareApp().then(() =>
   startTransition(() => {
     hydrateRoot(
       document,
       <StrictMode>
-        <SocketProvider>
-          <Provider store={store}>
-            <RemixBrowser />
-          </Provider>
-        </SocketProvider>
+        <Provider store={store}>
+          <AuthProvider>
+            <QueryClientProvider client={queryClient}>
+              <SettingsProvider>
+                <HydratedRouter />
+                <PosthogInit />
+              </SettingsProvider>
+            </QueryClientProvider>
+          </AuthProvider>
+        </Provider>
       </StrictMode>,
     );
   }),

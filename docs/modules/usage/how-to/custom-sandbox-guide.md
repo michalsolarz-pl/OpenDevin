@@ -9,8 +9,8 @@ as python and Node.js but may need other software installed by default.
 
 You have two options for customization:
 
-1. Use an existing image with the required software.
-2. Create your own custom Docker image.
+- Use an existing image with the required software.
+- Create your own custom Docker image.
 
 If you choose the first option, you can skip the `Create Your Docker Image` section.
 
@@ -18,13 +18,19 @@ If you choose the first option, you can skip the `Create Your Docker Image` sect
 
 To create a custom Docker image, it must be Debian based.
 
-For example, if you want OpenHands to have `ruby` installed, create a `Dockerfile` with the following content:
+For example, if you want OpenHands to have `ruby` installed, you could create a `Dockerfile` with the following content:
 
 ```dockerfile
-FROM debian:latest
+FROM nikolaik/python-nodejs:python3.12-nodejs22
 
 # Install required packages
 RUN apt-get update && apt-get install -y ruby
+```
+
+Or you could use a Ruby-specific base image:
+
+```dockerfile
+FROM ruby:latest
 ```
 
 Save this file in a folder. Then, build your Docker image (e.g., named custom-image) by navigating to the folder in
@@ -35,8 +41,16 @@ docker build -t custom-image .
 
 This will produce a new image called `custom-image`, which will be available in Docker.
 
-> Note that in the configuration described in this document, OpenHands will run as user "openhands" inside the
-> sandbox and thus all packages installed via the docker file should be available to all users on the system, not just root.
+## Using the Docker Command
+
+When running OpenHands using [the docker command](/modules/usage/installation#start-the-app), replace
+`-e SANDBOX_RUNTIME_CONTAINER_IMAGE=...` with `-e SANDBOX_BASE_CONTAINER_IMAGE=<custom image name>`:
+
+```commandline
+docker run -it --rm --pull=always \
+    -e SANDBOX_BASE_CONTAINER_IMAGE=custom-image \
+    ...
+```
 
 ## Using the Development Workflow
 
@@ -55,32 +69,28 @@ This can be an image you’ve already pulled or one you’ve built:
 sandbox_base_container_image="custom-image"
 ```
 
-### Run
+### Additional Configuration Options
 
-Run OpenHands by running ```make run``` in the top level directory.
-
-## Technical Explanation
-
-Please refer to [custom docker image section of the runtime documentation](https://docs.all-hands.dev/modules/usage/architecture/runtime#advanced-how-openhands-builds-and-maintains-od-runtime-images) for more details.
-
-## Troubleshooting / Errors
-
-### Error: ```useradd: UID 1000 is not unique```
-
-If you see this error in the console output it is because OpenHands is trying to create the openhands user in the sandbox with a UID of 1000, however this UID is already being used in the image (for some reason). To fix this change the sandbox_user_id field in the config.toml file to a different value:
+The `config.toml` file supports several other options for customizing your sandbox:
 
 ```toml
 [core]
-workspace_base="./workspace"
-run_as_openhands=true
-sandbox_base_container_image="custom_image"
-sandbox_user_id="1001"
+# Install additional dependencies when the runtime is built
+# Can contain any valid shell commands
+# If you need the path to the Python interpreter in any of these commands, you can use the $OH_INTERPRETER_PATH variable
+runtime_extra_deps = """
+pip install numpy pandas
+apt-get update && apt-get install -y ffmpeg
+"""
+
+# Set environment variables for the runtime
+# Useful for configuration that needs to be available at runtime
+runtime_startup_env_vars = { DATABASE_URL = "postgresql://user:pass@localhost/db" }
+
+# Specify platform for multi-architecture builds (e.g., "linux/amd64" or "linux/arm64")
+platform = "linux/amd64"
 ```
 
-### Port use errors
+### Run
 
-If you see an error about a port being in use or unavailable, try deleting all running Docker Containers (run `docker ps` and `docker rm` relevant containers) and then re-running ```make run``` .
-
-## Discuss
-
-For other issues or questions join the [Slack](https://join.slack.com/t/opendevin/shared_invite/zt-2oikve2hu-UDxHeo8nsE69y6T7yFX_BA) or [Discord](https://discord.gg/ESHStjSjD4) and ask!
+Run OpenHands by running ```make run``` in the top level directory.

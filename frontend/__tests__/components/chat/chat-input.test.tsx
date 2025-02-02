@@ -1,7 +1,7 @@
 import userEvent from "@testing-library/user-event";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, afterEach, vi, it, expect } from "vitest";
-import { ChatInput } from "#/components/chat-input";
+import { ChatInput } from "#/components/features/chat/chat-input";
 
 describe("ChatInput", () => {
   const onSubmitMock = vi.fn();
@@ -51,6 +51,22 @@ describe("ChatInput", () => {
     expect(onSubmitMock).not.toHaveBeenCalled();
   });
 
+  it("should not call onSubmit when the message is only whitespace", async () => {
+    const user = userEvent.setup();
+    render(<ChatInput onSubmit={onSubmitMock} />);
+    const textarea = screen.getByRole("textbox");
+
+    await user.type(textarea, "   ");
+    await user.keyboard("{Enter}");
+
+    expect(onSubmitMock).not.toHaveBeenCalled();
+
+    await user.type(textarea, " \t\n");
+    await user.keyboard("{Enter}");
+
+    expect(onSubmitMock).not.toHaveBeenCalled();
+  });
+
   it("should disable submit", async () => {
     const user = userEvent.setup();
     render(<ChatInput disabled onSubmit={onSubmitMock} />);
@@ -68,12 +84,10 @@ describe("ChatInput", () => {
     expect(onSubmitMock).not.toHaveBeenCalled();
   });
 
-  it("should render a placeholder", () => {
-    render(
-      <ChatInput placeholder="Enter your message" onSubmit={onSubmitMock} />,
-    );
+  it("should render a placeholder with translation key", () => {
+    render(<ChatInput onSubmit={onSubmitMock} />);
 
-    const textarea = screen.getByPlaceholderText("Enter your message");
+    const textarea = screen.getByPlaceholderText("SUGGESTIONS$WHAT_TO_BUILD");
     expect(textarea).toBeInTheDocument();
   });
 
@@ -157,5 +171,75 @@ describe("ChatInput", () => {
 
     await user.tab();
     expect(onBlurMock).toHaveBeenCalledOnce();
+  });
+
+  it("should handle text paste correctly", () => {
+    const onSubmit = vi.fn();
+    const onChange = vi.fn();
+
+    render(<ChatInput onSubmit={onSubmit} onChange={onChange} />);
+
+    const input = screen.getByTestId("chat-input").querySelector("textarea");
+    expect(input).toBeTruthy();
+
+    // Fire paste event with text data
+    fireEvent.paste(input!, {
+      clipboardData: {
+        getData: (type: string) => (type === "text/plain" ? "test paste" : ""),
+        files: [],
+      },
+    });
+  });
+
+  it("should handle image paste correctly", () => {
+    const onSubmit = vi.fn();
+    const onImagePaste = vi.fn();
+
+    render(<ChatInput onSubmit={onSubmit} onImagePaste={onImagePaste} />);
+
+    const input = screen.getByTestId("chat-input").querySelector("textarea");
+    expect(input).toBeTruthy();
+
+    // Create a paste event with an image file
+    const file = new File(["dummy content"], "image.png", {
+      type: "image/png",
+    });
+
+    // Fire paste event with image data
+    fireEvent.paste(input!, {
+      clipboardData: {
+        getData: () => "",
+        files: [file],
+      },
+    });
+
+    // Verify image paste was handled
+    expect(onImagePaste).toHaveBeenCalledWith([file]);
+  });
+
+  it("should not submit when Enter is pressed during IME composition", async () => {
+    const user = userEvent.setup();
+    render(<ChatInput onSubmit={onSubmitMock} />);
+    const textarea = screen.getByRole("textbox");
+
+    await user.type(textarea, "こんにちは");
+
+    // Simulate Enter during IME composition
+    fireEvent.keyDown(textarea, {
+      key: "Enter",
+      isComposing: true,
+      nativeEvent: { isComposing: true },
+    });
+
+    expect(onSubmitMock).not.toHaveBeenCalled();
+
+    // Simulate normal Enter after composition is done
+    fireEvent.keyDown(textarea, {
+      key: "Enter",
+      isComposing: false,
+      nativeEvent: { isComposing: false },
+    });
+
+    expect(onSubmitMock).toHaveBeenCalledWith("こんにちは");
   });
 });

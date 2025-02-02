@@ -36,10 +36,13 @@ class Conversation:
             event_stream=self.event_stream,
             sid=self.sid,
             attach_to_existing=True,
+            headless_mode=False,
         )
 
     async def connect(self):
         await self.runtime.connect()
 
     async def disconnect(self):
+        if self.event_stream:
+            self.event_stream.close()
         asyncio.create_task(call_sync_from_async(self.runtime.close))
